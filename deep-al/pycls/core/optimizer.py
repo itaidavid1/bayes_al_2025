@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 
-def construct_optimizer(cfg, model):
+def construct_optimizer(cfg, model, opt_init_state=None):
     """Constructs the optimizer.
 
     Note that the momentum update in PyTorch differs from the one in Caffe2.
@@ -33,7 +33,10 @@ def construct_optimizer(cfg, model):
     when the learning rate is changed there is no need to perform the
     momentum correction by scaling V (unlike in the Caffe2 case).
     """
-    if cfg.BN.USE_CUSTOM_WEIGHT_DECAY:
+    if cfg.MODEL.USE_1NN:
+        return None
+
+    elif cfg.BN.USE_CUSTOM_WEIGHT_DECAY:
         # Apply different weight decay to Batchnorm and non-batchnorm parameters.
         p_bn = [p for n, p in model.named_parameters() if "bn" in n]
         p_non_bn = [p for n, p in model.named_parameters() if "bn" not in n]
@@ -61,6 +64,11 @@ def construct_optimizer(cfg, model):
         )
     else:
         raise NotImplementedError
+
+    if opt_init_state is not None:
+        # Load the model state into the optimizer.
+        # This is useful for resuming training from a checkpoint.
+        optimizer.load_state_dict(opt_init_state)
 
     return optimizer
 

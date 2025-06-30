@@ -14,7 +14,7 @@ OPTIM:
   LR_POLICY: cos
   LR_MULT: 0.1
   # STEPS: [0, 60, 120, 160, 200] 
-  MAX_EPOCH: 200
+  MAX_EPOCH: 200 # for eval net 200 for embedding and 500 for images
   MOMENTUM: 0.9
   NESTEROV: True
   WEIGHT_DECAY: 0.0003
@@ -36,7 +36,7 @@ ACTIVE_LEARNING:
   INIT_L_RATIO: 0.
 #  BUDGET_SIZE: 10
   # SAMPLING_FN: 'uncertainty'
-  MAX_ITER: 5
+  MAX_ITER: 32 # for active learning steps
   FINE_TUNE: False
   DELTA_RESOLUTION: 0.05
   MAX_DELTA: 1.1

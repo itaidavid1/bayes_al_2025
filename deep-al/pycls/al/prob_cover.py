@@ -2,6 +2,9 @@ import numpy as np
 import pandas as pd
 import torch
 import pycls.datasets.utils as ds_utils
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+from tools.utils import visualize_tsne
 
 class ProbCover:
     def __init__(self, cfg, lSet, uSet, budgetSize, delta):
@@ -16,6 +19,8 @@ class ProbCover:
         self.relevant_indices = np.concatenate([self.lSet, self.uSet]).astype(int)
         self.rel_features = self.all_features[self.relevant_indices]
         self.graph_df = self.construct_graph()
+        self.activeSet = []
+        print(self.lSet)
 
     def construct_graph(self, batch_size=500):
         """
@@ -82,7 +87,12 @@ class ProbCover:
         assert len(selected) == self.budgetSize, 'added a different number of samples'
         activeSet = self.relevant_indices[selected]
         remainSet = np.array(sorted(list(set(self.uSet) - set(activeSet))))
-
+        self.activeSet = activeSet
         print(f'Finished the selection of {len(activeSet)} samples.')
         print(f'Active set is {activeSet}')
         return activeSet, remainSet
+
+    def plot_tsne(self):
+        labeled_indices = np.array(self.lSet).astype(int)
+        sampled_indices = np.array(self.activeSet).astype(int)
+        visualize_tsne(labeled_indices, sampled_indices, algo_name='ProbCover')

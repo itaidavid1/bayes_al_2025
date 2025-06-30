@@ -10,6 +10,8 @@ from pycls.models.alexnet import *
 import torch
 from torch import nn
 from torch.nn import functional as F
+
+from sklearn.neighbors import KNeighborsClassifier
 # Supported models
 _models = {
     # VGG style architectures
@@ -77,15 +79,19 @@ def get_loss_fun(cfg):
 
 def build_model(cfg):
     """Builds the model."""
-    if cfg.MODEL.LINEAR_FROM_FEATURES:
+    if cfg.MODEL.USE_1NN:
+        model = KNeighborsClassifier(n_neighbors=1)
+        return model
+
+    elif cfg.MODEL.LINEAR_FROM_FEATURES:
         num_features = 384 if cfg.DATASET.NAME in ['IMAGENET50', 'IMAGENET100', 'IMAGENET200'] else 512
-        return FeaturesNet(num_features, cfg.MODEL.NUM_CLASSES)
+        return FeaturesNet(num_features, cfg.MODEL.NUM_CLASSES).cuda()
 
     model = get_model(cfg)(num_classes=cfg.MODEL.NUM_CLASSES, use_dropout=True)
     if cfg.DATASET.NAME == 'MNIST':
         model.conv1 =  torch.nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
     
-    return model 
+    return model.cuda()
 
 
 def build_loss_fun(cfg):

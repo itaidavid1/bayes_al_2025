@@ -25,6 +25,7 @@ import pycls.utils.checkpoint as cu
 import pycls.utils.logging as lu
 import pycls.utils.metrics as mu
 import pycls.utils.net as nu
+import pycls.utils.model_handler as mh
 from pycls.utils.meters import TestMeter
 from pycls.utils.meters import TrainMeter
 from pycls.utils.meters import ValMeter
@@ -44,6 +45,45 @@ delta_avg_lst = []
 delta_std_lst = []
 
 
+def plot_arrays(x_vals, y_vals, x_name, y_name, dataset_name, out_dir, isDebug=False):
+    # if not du.is_master_proc():
+    #     return
+
+    import matplotlib.pyplot as plt
+    temp_name = "{}_vs_{}".format(x_name, y_name)
+    plt.xlabel(x_name)
+    plt.ylabel(y_name)
+    plt.title("Dataset: {}; {}".format(dataset_name, temp_name))
+    plt.plot(x_vals, y_vals)
+
+    if isDebug: print("plot_saved at : {}".format(os.path.join(out_dir, temp_name + '.png')))
+
+    plt.savefig(os.path.join(out_dir, temp_name + ".png"))
+    plt.close()
+
+
+def save_plot_values(temp_arrays, temp_names, out_dir, isParallel=True, saveInTextFormat=False, isDebug=True):
+    """ Saves arrays provided in the list in npy format """
+    # Return if not master process
+    # if isParallel:
+    #     if not du.is_master_proc():
+    #         return
+
+    for i in range(len(temp_arrays)):
+        temp_arrays[i] = np.array(temp_arrays[i])
+        temp_dir = out_dir
+        # if cfg.TRAIN.TRANSFER_EXP:
+        #     temp_dir += os.path.join("transfer_experiment",cfg.MODEL.TRANSFER_MODEL_TYPE+"_depth_"+str(cfg.MODEL.TRANSFER_MODEL_DEPTH))+"/"
+
+        if not os.path.exists(temp_dir):
+            os.makedirs(temp_dir)
+        if saveInTextFormat:
+            # if isDebug: print(f"Saving {temp_names[i]} at {temp_dir+temp_names[i]}.txt in text format!!")
+            np.savetxt(temp_dir + '/' + temp_names[i] + ".txt", temp_arrays[i], fmt="%d")
+        else:
+            # if isDebug: print(f"Saving {temp_names[i]} at {temp_dir+temp_names[i]}.npy in numpy format!!")
+            np.save(temp_dir + '/' + temp_names[i] + ".npy", temp_arrays[i])
+
 def str2bool(v):
     if isinstance(v, bool):
         return v
@@ -59,16 +99,20 @@ def argparser():
     parser = argparse.ArgumentParser(description='Active Learning - Image Classification')
     parser.add_argument('--cfg', dest='cfg_file', help='Config file', required=True, type=str)
     parser.add_argument('--exp-name', help='Experiment Name', required=True, type=str)
-    parser.add_argument('--al', help='AL Method', required=True, type=str)
-    parser.add_argument('--budget', help='Budget Per Round', required=True, type=int)
+    parser.add_argument('--al', help='AL Method', required=True, type=str) ## active learning type -> write TypiClust_rp\_dc
+    parser.add_argument('--budget', help='Budget Per Round', required=True, type=int) ## in each iteration how much labels can I get
     parser.add_argument('--initial_size', help='Size of the initial random labeled set', default=0, type=int)
     parser.add_argument('--seed', help='Random seed', default=1, type=int)
-    parser.add_argument('--finetune', help='Whether to continue with existing model between rounds', type=str2bool, default=False)
-    parser.add_argument('--linear_from_features', help='Whether to use a linear layer from self-supervised features', action='store_true')
+    parser.add_argument('--finetune', help='Whether to continue with existing model between rounds', type=str2bool, default=False) # train the eval model from last ckpt and not from scratch (between iters)
+    parser.add_argument('--eval_model_type', help='eval_model_type', type=str) # train the eval model from features not images
+    # parser.add_argument('--linear_from_features', help='Whether to use a linear layer from self-supervised features', action='store_true') # train the eval model from features not images
     parser.add_argument('--initial_delta', help='Relevant only for ProbCover and DCoM', default=0.6, type=float)
     parser.add_argument('--k_logistic', default=50, type=int)
     parser.add_argument('--a_logistic', default=0.8, type=float)
-
+    parser.add_argument('--alpha', default=0.5, type=float)
+    parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--norm_importance', action='store_true')
+    parser.add_argument('--own_alpha_weighting', action='store_true')
     return parser
 
 
@@ -107,12 +151,23 @@ def main(cfg):
     # all logs, labeled, unlabeled, validation sets are stroed here 
     # E.g., output/CIFAR10/resnet18/{timestamp or cfg.EXP_NAME based on arguments passed}
     if cfg.EXP_NAME == 'auto':
-        now = datetime.now()
-        exp_dir = f'{now.year}_{now.month}_{now.day}_{now.hour:02}{now.minute:02}{now.second:02}_{now.microsecond}'
+        # now = datetime.now()
+        # exp_suffix = f'{now.year}_{now.month}_{now.day}_{now.hour:02}{now.minute:02}{now.second:02}_{now.microsecond}'
+        # exp_dir = f'{cfg.DATASET.NAME}_{cfg.MODEL.TYPE}_{exp_suffix}'
+        exp_prefix = ""
     else:
-        exp_dir = cfg.EXP_NAME
+        exp_prefix = f"{cfg.EXP_NAME}_"
 
-    exp_dir = os.path.join(dataset_out_dir, exp_dir)
+    now = datetime.now()
+    day_dir = f'{now.year}_{now.month}_{now.day}'
+    exp_suffix = f'{now.year}_{now.month}_{now.day}_{now.hour:02}{now.minute:02}{now.second:02}_{now.microsecond}'
+    exp_name = f'{exp_prefix}{cfg.DATASET.NAME}_{cfg.ACTIVE_LEARNING.SAMPLING_FN}_{cfg.EVAL_MODEL_TYPE}_{exp_suffix}'
+
+    full_day_dir = os.path.join(dataset_out_dir, day_dir)
+    if not os.path.exists(full_day_dir):
+        os.mkdir(full_day_dir)
+
+    exp_dir = os.path.join(full_day_dir, exp_name)
     if not os.path.exists(exp_dir):
         os.mkdir(exp_dir)
         print("Experiment Directory is {}.\n".format(exp_dir))
@@ -145,8 +200,9 @@ def main(cfg):
 
     lSet, uSet, valSet = data_obj.loadPartitions(lSetPath=cfg.ACTIVE_LEARNING.LSET_PATH, \
             uSetPath=cfg.ACTIVE_LEARNING.USET_PATH, valSetPath = cfg.ACTIVE_LEARNING.VALSET_PATH)
-    model = model_builder.build_model(cfg).cuda()
-
+    # model = model_builder.build_model(cfg).cuda()
+    model = mh.get_model(cfg)
+    np.save(f"/cs/labs/daphna/itai.david/py_repos/TypiClust/results/t-sne/CIFAR10_t-sne_labels.npy", train_data.targets)
     if len(lSet) == 0:
         if cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ['dcom']:
             print('Labeled Set is Empty - Create and save the first delta values list')
@@ -173,14 +229,15 @@ def main(cfg):
     test_loader = data_obj.getTestLoader(data=test_data, test_batch_size=cfg.TRAIN.BATCH_SIZE, seed_id=cfg.RNG_SEED)
 
     # Initialize the model.  
-    model = model_builder.build_model(cfg)
     print("model: {}\n".format(cfg.MODEL.TYPE))
     logger.info("model: {}\n".format(cfg.MODEL.TYPE))
 
     # Construct the optimizer
+    # model = model_builder.build_model(cfg)
+    model = mh.get_model(cfg)
     optimizer = optim.construct_optimizer(cfg, model)
-    opt_init_state = deepcopy(optimizer.state_dict())
-    model_init_state = deepcopy(model.state_dict().copy())
+    opt_init_state = deepcopy(optimizer.state_dict()) if not cfg.MODEL.USE_1NN else None
+    model_init_state = deepcopy(model.state_dict().copy()) if not cfg.MODEL.USE_1NN else None
 
     print("optimizer: {}\n".format(optimizer))
     logger.info("optimizer: {}\n".format(optimizer))
@@ -199,21 +256,8 @@ def main(cfg):
             os.mkdir(episode_dir)
         cfg.EPISODE_DIR = episode_dir
 
-        # Train model
-        print("======== TRAINING ========")
-        logger.info("======== TRAINING ========")
-
-        best_val_acc, best_val_epoch, checkpoint_file = train_model(lSet_loader, valSet_loader, model, optimizer, cfg)
-
-        print("Best Validation Accuracy: {}\nBest Epoch: {}\n".format(round(best_val_acc, 4), best_val_epoch))
-        logger.info("EPISODE {} Best Validation Accuracy: {}\tBest Epoch: {}\n".format(cur_episode, round(best_val_acc, 4), best_val_epoch))
-
-        # Test best model checkpoint
-        print("======== TESTING ========\n")
-        logger.info("======== TESTING ========\n")
-        test_acc = test_model(test_loader, checkpoint_file, cfg, cur_episode)
-        print("Test Accuracy: {}.\n".format(round(test_acc, 4)))
-        logger.info("EPISODE {} Test Accuracy {}.\n".format(cur_episode, test_acc))
+        checkpoint_file = train_and_eval_model(cfg, cur_episode, lSet_loader, model, optimizer, test_loader,
+                                               valSet_loader)
 
         # No need to perform active sampling in the last episode iteration
         if cur_episode == cfg.ACTIVE_LEARNING.MAX_ITER:
@@ -223,53 +267,12 @@ def main(cfg):
             break
 
         # DCoM's delta-s updating
-        if cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["dcom"]:
-            print("======== Update the deltas dynamically ========\n")
-            from pycls.al.DCoM import DCoM
-            al_algo = DCoM(cfg, lSet, uSet, budgetSize=cfg.ACTIVE_LEARNING.BUDGET_SIZE,
-                                    max_delta=cfg.ACTIVE_LEARNING.MAX_DELTA,
-                                    lSet_deltas=cfg.ACTIVE_LEARNING.DELTA_LST)
-
-            lSet_labels = np.take(train_data.targets, np.asarray(lSet, dtype=np.int64))
-            all_images_idx = np.array(list(lSet) + list(uSet))
-            images_loader = data_obj.getSequentialDataLoader(indexes=all_images_idx,
-                                                    batch_size=cfg.TRAIN.BATCH_SIZE, data=train_data)
-            all_labels = np.take(train_data.targets, np.asarray(all_images_idx, dtype=np.int64))
-
-            images_pseudo_labels = get_label_from_model(images_loader, checkpoint_file, cfg)
-            cfg.ACTIVE_LEARNING.DELTA_LST[
-            -1 * cfg.ACTIVE_LEARNING.BUDGET_SIZE:] = al_algo.new_centroids_deltas(lSet_labels,
-                                                                          all_labels=all_labels,
-                                                                          pseudo_labels=images_pseudo_labels,
-                                                                          budget=cfg.ACTIVE_LEARNING.BUDGET_SIZE)
-
-            delta_lst_float = [np.float(delta) for delta in cfg.ACTIVE_LEARNING.DELTA_LST]
-            delta_avg_lst.append(np.average(delta_lst_float))
-            delta_std_lst.append(np.std(delta_lst_float))
+        Dcom_delta_update(cfg, data_obj, checkpoint_file, lSet, train_data, uSet)
 
         # Active Sample 
-        print("======== ACTIVE SAMPLING ========\n")
-        logger.info("======== ACTIVE SAMPLING ========\n")
-        al_obj = ActiveLearning(data_obj, cfg)
-        clf_model = model_builder.build_model(cfg)
-        clf_model = cu.load_checkpoint(checkpoint_file, clf_model)
-        activeSet, new_uSet = al_obj.sample_from_uSet(clf_model, lSet, uSet, train_data)
-
-        # Save current lSet, new_uSet and activeSet in the episode directory
-        data_obj.saveSets(lSet, uSet, activeSet, cfg.EPISODE_DIR)
-
-        # Add activeSet to lSet, save new_uSet as uSet and update dataloader for the next episode
-        lSet = np.append(lSet, activeSet)
-        uSet = new_uSet
-
-        lSet_loader = data_obj.getIndexesDataLoader(indexes=lSet, batch_size=cfg.TRAIN.BATCH_SIZE, data=train_data)
-        valSet_loader = data_obj.getIndexesDataLoader(indexes=valSet, batch_size=cfg.TRAIN.BATCH_SIZE, data=train_data)
-        uSet_loader = data_obj.getSequentialDataLoader(indexes=uSet, batch_size=cfg.TRAIN.BATCH_SIZE, data=train_data)
-
-        print("Active Sampling Complete. After Episode {}:\nNew Labeled Set: {}, New Unlabeled Set: {}, Active Set: {}\n".format(cur_episode, len(lSet), len(uSet), len(activeSet)))
-        logger.info("Active Sampling Complete. After Episode {}:\nNew Labeled Set: {}, New Unlabeled Set: {}, Active Set: {}\n".format(cur_episode, len(lSet), len(uSet), len(activeSet)))
-        print("================================\n\n")
-        logger.info("================================\n\n")
+        lSet, lSet_loader, uSet, valSet_loader = active_sampling_part(cfg, checkpoint_file, cur_episode, data_obj, lSet,
+                                                                      lSet_loader, train_data, uSet, valSet,
+                                                                      valSet_loader)
 
         # add avg delta to cfg.ACTIVE_LEARNING.DELTA_LST towards the next active sampling
         if cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ['dcom']:
@@ -284,14 +287,84 @@ def main(cfg):
         if not cfg.ACTIVE_LEARNING.FINE_TUNE:
             # start model from scratch
             print('Starting model from scratch - ignoring existing weights.')
-            model = model_builder.build_model(cfg)
+            model = mh.get_model(cfg, model_init_state=model_init_state)
             # Construct the optimizer
-            optimizer = optim.construct_optimizer(cfg, model)
-            print(model.load_state_dict(model_init_state))
-            print(optimizer.load_state_dict(opt_init_state))
+            optimizer = optim.construct_optimizer(cfg, model, opt_init_state=opt_init_state)
 
-        os.remove(checkpoint_file)
+        if checkpoint_file is not None:
+            os.remove(checkpoint_file)
 
+
+def active_sampling_part(cfg, checkpoint_file, cur_episode, data_obj, lSet, lSet_loader, train_data, uSet, valSet,
+                         valSet_loader):
+    print("======== ACTIVE SAMPLING ========\n")
+    logger.info("======== ACTIVE SAMPLING ========\n")
+    al_obj = ActiveLearning(data_obj, cfg)
+    # clf_model = model_builder.build_model(cfg)
+    # clf_model = cu.load_checkpoint(checkpoint_file, clf_model)
+    clf_model = mh.get_model(cfg, checkpoint_file)
+    activeSet, new_uSet = al_obj.sample_from_uSet(clf_model, lSet, uSet, train_data)
+    # Save current lSet, new_uSet and activeSet in the episode directory
+    data_obj.saveSets(lSet, uSet, activeSet, cfg.EPISODE_DIR)
+    # Add activeSet to lSet, save new_uSet as uSet and update dataloader for the next episode
+    lSet = np.append(lSet, activeSet)
+    uSet = new_uSet
+    lSet_loader = data_obj.getIndexesDataLoader(indexes=lSet, batch_size=cfg.TRAIN.BATCH_SIZE, data=train_data)
+    valSet_loader = data_obj.getIndexesDataLoader(indexes=valSet, batch_size=cfg.TRAIN.BATCH_SIZE, data=train_data)
+    # uSet_loader = data_obj.getSequentialDataLoader(indexes=uSet, batch_size=cfg.TRAIN.BATCH_SIZE, data=train_data)
+    print(
+        "Active Sampling Complete. After Episode {}:\nNew Labeled Set: {}, New Unlabeled Set: {}, Active Set: {}\n".format(
+            cur_episode, len(lSet), len(uSet), len(activeSet)))
+    logger.info(
+        "Active Sampling Complete. After Episode {}:\nNew Labeled Set: {}, New Unlabeled Set: {}, Active Set: {}\n".format(
+            cur_episode, len(lSet), len(uSet), len(activeSet)))
+    print("================================\n\n")
+    logger.info("================================\n\n")
+    return lSet, lSet_loader, uSet, valSet_loader
+
+
+def train_and_eval_model(cfg, cur_episode, lSet_loader, model, optimizer, test_loader, valSet_loader):
+    # Train model
+    print("======== TRAINING ========")
+    logger.info("======== TRAINING ========")
+    best_val_acc, best_val_epoch, checkpoint_file, model = train_model(lSet_loader, valSet_loader, model, optimizer, cfg)
+    print("Best Validation Accuracy: {}\nBest Epoch: {}\n".format(round(best_val_acc, 4), best_val_epoch))
+    logger.info("EPISODE {} Best Validation Accuracy: {}\tBest Epoch: {}\n".format(cur_episode, round(best_val_acc, 4),
+                                                                                   best_val_epoch))
+    # Test best model checkpoint
+    print("======== TESTING ========\n")
+    logger.info("======== TESTING ========\n")
+    test_acc = test_model(test_loader, checkpoint_file, cfg, cur_episode, model)
+    print("Test Accuracy: {}.\n".format(round(test_acc, 4)))
+    logger.info("EPISODE {} Test Accuracy {}.\n".format(cur_episode, test_acc))
+    return checkpoint_file
+
+
+def Dcom_delta_update(cfg, data_obj, checkpoint_file, lSet, train_data, uSet):
+
+    if cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["dcom"]:
+        print("======== Update the deltas dynamically ========\n")
+        from pycls.al.DCoM import DCoM
+        al_algo = DCoM(cfg, lSet, uSet, budgetSize=cfg.ACTIVE_LEARNING.BUDGET_SIZE,
+                       max_delta=cfg.ACTIVE_LEARNING.MAX_DELTA,
+                       lSet_deltas=cfg.ACTIVE_LEARNING.DELTA_LST)
+
+        lSet_labels = np.take(train_data.targets, np.asarray(lSet, dtype=np.int64))
+        all_images_idx = np.array(list(lSet) + list(uSet))
+        images_loader = data_obj.getSequentialDataLoader(indexes=all_images_idx,
+                                                         batch_size=cfg.TRAIN.BATCH_SIZE, data=train_data)
+        all_labels = np.take(train_data.targets, np.asarray(all_images_idx, dtype=np.int64))
+
+        images_pseudo_labels = get_label_from_model(images_loader, checkpoint_file, cfg)
+        cfg.ACTIVE_LEARNING.DELTA_LST[
+        -1 * cfg.ACTIVE_LEARNING.BUDGET_SIZE:] = al_algo.new_centroids_deltas(lSet_labels,
+                                                                              all_labels=all_labels,
+                                                                              pseudo_labels=images_pseudo_labels,
+                                                                              budget=cfg.ACTIVE_LEARNING.BUDGET_SIZE)
+
+        delta_lst_float = [np.float(delta) for delta in cfg.ACTIVE_LEARNING.DELTA_LST]
+        delta_avg_lst.append(np.average(delta_lst_float))
+        delta_std_lst.append(np.std(delta_lst_float))
 
 
 def train_model(train_loader, val_loader, model, optimizer, cfg):
@@ -303,6 +376,17 @@ def train_model(train_loader, val_loader, model, optimizer, cfg):
 
     global plot_it_x_values
     global plot_it_y_values
+
+    if cfg.MODEL.USE_1NN:  # TODO move to train_model function
+
+        train_data, train_labels = list(iter(train_loader))[0]
+        model.fit(train_data, train_labels)
+
+        val_data, val_labels = list(iter(val_loader))[0]
+        preds = model.predict(val_data)
+        test_acc = 100. * (preds == np.array(val_labels)).mean()
+
+        return test_acc, 0, None, model
 
     start_epoch = 0
     loss_fun = losses.get_loss_fun()
@@ -407,10 +491,10 @@ def train_model(train_loader, val_loader, model, optimizer, cfg):
     best_val_acc = temp_best_val_acc
     best_val_epoch = temp_best_val_epoch
 
-    return best_val_acc, best_val_epoch, checkpoint_file
+    return best_val_acc, best_val_epoch, checkpoint_file, None
 
 
-def test_model(test_loader, checkpoint_file, cfg, cur_episode):
+def test_model(test_loader, checkpoint_file, cfg, cur_episode, model):
 
     global plot_episode_xvalues
     global plot_episode_yvalues
@@ -423,20 +507,30 @@ def test_model(test_loader, checkpoint_file, cfg, cur_episode):
 
     test_meter = TestMeter(len(test_loader))
 
-    model = model_builder.build_model(cfg)
-    model = cu.load_checkpoint(checkpoint_file, model)
+    # model = model_builder.build_model(cfg)
+    # model = cu.load_checkpoint(checkpoint_file, model, weights_only=False)
 
-    test_err = test_epoch(test_loader, model, test_meter, cur_episode)
-    test_acc = 100. - test_err
+
+    if cfg.MODEL.USE_1NN:
+        # # 1NN model does not have a predict method, so we use the fit method to train it
+        data = test_loader.dataset.features
+        labels = test_loader.dataset.targets
+        preds = model.predict(data)
+        test_acc = 100. * (preds == np.array(labels)).mean()
+        # return test_acc
+    else:
+        model = mh.get_model(cfg, checkpoint_file)
+        test_err = test_epoch(test_loader, model, test_meter, cur_episode)
+        test_acc = 100. - test_err
 
     plot_episode_xvalues.append(cur_episode)
     plot_episode_yvalues.append(test_acc)
+    print(f"OUTPUT FOLDER IS {cfg.EXP_DIR}")
+    plot_arrays(x_vals=plot_episode_xvalues, y_vals=plot_episode_yvalues, \
+                x_name="Episodes", y_name="Test Accuracy", dataset_name=cfg.DATASET.NAME, out_dir=cfg.EXP_DIR)
 
-    # plot_arrays(x_vals=plot_episode_xvalues, y_vals=plot_episode_yvalues, \
-    #     x_name="Episodes", y_name="Test Accuracy", dataset_name=cfg.DATASET.NAME, out_dir=cfg.EXP_DIR)
-    #
-    # save_plot_values([plot_episode_xvalues, plot_episode_yvalues], \
-    #     ["plot_episode_xvalues", "plot_episode_yvalues"], out_dir=cfg.EXP_DIR)
+    save_plot_values([plot_episode_xvalues, plot_episode_yvalues], \
+                     ["plot_episode_xvalues", "plot_episode_yvalues"], out_dir=cfg.EXP_DIR)
 
     return test_acc
 
@@ -526,8 +620,10 @@ def get_label_from_model(images_loader, checkpoint_file, cfg, model=None):
     """
     get_label_meter = TestMeter(len(images_loader))
     if model is None:
-        model = model_builder.build_model(cfg)
-        model = cu.load_checkpoint(checkpoint_file, model)
+        # model = model_builder.build_model(cfg)
+        # model = cu.load_checkpoint(checkpoint_file, model)
+        model = mh.get_model(cfg, checkpoint_file)
+
 
     pred = get_label_epoch(images_loader, model, get_label_meter)
     return pred
@@ -612,15 +708,89 @@ def get_label_epoch(images_loader, model, get_label_meter):
     return final_preds
 
 
+def define_eval_model_type(cfg, debug=False):
+    if cfg.EVAL_MODEL_TYPE == 'NN1':
+        cfg.MODEL.USE_1NN = True
+        cfg.MODEL.LINEAR_FROM_FEATURES = True
+        cfg.MODEL.LINEAR_FROM_IMAGES = False
+        if debug:
+            cfg.OPTIM.MAX_EPOCH = 1
+        else:
+            cfg.OPTIM.MAX_EPOCH = 200
+    elif cfg.EVAL_MODEL_TYPE == 'from_features':
+        cfg.MODEL.USE_1NN = False
+        cfg.MODEL.LINEAR_FROM_FEATURES = True
+        cfg.MODEL.LINEAR_FROM_IMAGES = False
+        if debug:
+            cfg.OPTIM.MAX_EPOCH = 1
+        else:
+            cfg.OPTIM.MAX_EPOCH = 200
+    elif cfg.EVAL_MODEL_TYPE == 'from_images':
+        cfg.MODEL.USE_1NN = False
+        cfg.MODEL.LINEAR_FROM_FEATURES = False
+        cfg.MODEL.LINEAR_FROM_IMAGES = True
+        if debug:
+            cfg.OPTIM.MAX_EPOCH = 1
+        else:
+            cfg.OPTIM.MAX_EPOCH = 500
+
 if __name__ == "__main__":
+    # print(1)
     args = argparser().parse_args()
     cfg.merge_from_file(args.cfg_file)
     cfg.EXP_NAME = args.exp_name
     cfg.ACTIVE_LEARNING.SAMPLING_FN = args.al
     cfg.ACTIVE_LEARNING.BUDGET_SIZE = args.budget
     cfg.ACTIVE_LEARNING.INITIAL_DELTA = args.initial_delta
-    cfg.RNG_SEED = args.seed
-    cfg.MODEL.LINEAR_FROM_FEATURES = args.linear_from_features
+    debug = cfg.DEBUG =  args.debug
+    if debug:
+        cfg.RNG_SEED = 0
+    else:
+        cfg.RNG_SEED = args.seed
+    cfg.ALPHA = args.alpha
+    cfg.NORM_IMPORTANCE = args.norm_importance
+    cfg.OWN_ALPHA_WEIGHTING = args.own_alpha_weighting
+
+    print("RNG_SEED is set to {}".format(cfg.RNG_SEED))
+    # cfg.MODEL.LINEAR_FROM_FEATURES = args.linear_from_features
     cfg.ACTIVE_LEARNING.A_LOGISTIC = args.a_logistic
     cfg.ACTIVE_LEARNING.K_LOGISTIC = args.k_logistic
+    cfg.EVAL_MODEL_TYPE = args.eval_model_type
+    define_eval_model_type(cfg)
+
     main(cfg)
+
+
+# --cfg ../configs/cifar10/al/RESNET18.yaml --al probcover --exp-name auto --initial_size 0 --budget 10 --initial_delta 0.75
+# """
+# #!/bin/bash
+# #SBATCH --mem=20g ## amount of memory
+# #SBATCH -c 20 ## number of cpu
+# #SBATCH --time=40:00:00 ## time limit for the process
+# #SBATCH --gres=gpu:a10:1,vmem:20g ## gpu::<type of gpu>:<number of gpus>,vmem:<amount of memory on gpu (max 10gb/24gb/40gb)>
+# #SBATCH --array=0-2 ## array of jobs to run (job 0, job 1, job 2)
+# #SBATCH --output /cs/labs/daphna/maorni_cse/SupContrast/run_outputs/run_exp_%A_%a.txt
+# ## those are the type of the potential gpus : gpu:rtx2080:1, gpu:a10:1, gpu:g4:1 (can check in the university for more)
+# dir=/cs/labs/daphna/maorni_cse/SupContrast
+#
+# cd $dir
+#
+# source /cs/labs/daphna/maorni_cse/virs/reembedding/bin/activate
+#
+# python run_it.py --job_id ${SLURM_ARRAY_TASK_ID}
+# """
+
+###some utils functions should be copied to train_al.py instead of train.py
+
+### need to change it to save the metrics in the test function of the eval model, it is not saving by default
+
+## change in the sbatch to my paths instead of Maor
+
+## scancel <job_id> to cancel the job
+
+## sbatch <script_name> to run the job
+
+## sbatch <script_name> --killable to run the job with killable resources
+
+
+## change alpha values (on from features)

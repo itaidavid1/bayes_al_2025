@@ -84,6 +84,35 @@ class ActiveLearning:
             probcov = ProbCover(self.cfg, lSet, uSet, budgetSize=self.cfg.ACTIVE_LEARNING.BUDGET_SIZE,
                             delta=self.cfg.ACTIVE_LEARNING.INITIAL_DELTA)
             activeSet, uSet = probcov.select_samples()
+            # probcov.plot_tsne()
+        elif self.cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["misp"]:
+            from .MISP import  MISP
+
+            misp = MISP(self.cfg, lSet, uSet, budgetSize=self.cfg.ACTIVE_LEARNING.BUDGET_SIZE,
+                        delta=self.cfg.ACTIVE_LEARNING.INITIAL_DELTA)
+            activeSet, uSet = misp.select_samples()
+            # misp.plot_tsne()
+
+        elif self.cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["mispc"]:
+            from .MISP_probcover import MISPC
+
+            misp = MISPC(self.cfg, lSet, uSet, budgetSize=self.cfg.ACTIVE_LEARNING.BUDGET_SIZE,
+                        delta=self.cfg.ACTIVE_LEARNING.INITIAL_DELTA)
+            activeSet, uSet = misp.select_samples()
+            # misp.plot_tsne()
+        elif self.cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["misp_plus"]:
+            from .MISP_plus import MISP_PLUS
+
+            mispp = MISP_PLUS(self.cfg, lSet, uSet, budgetSize=self.cfg.ACTIVE_LEARNING.BUDGET_SIZE, train_data=trainDataset,
+                        delta=self.cfg.ACTIVE_LEARNING.INITIAL_DELTA)
+            activeSet, uSet = mispp.select_samples()
+            # misp.plot_tsne()
+        elif self.cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["maxherding", "max_herding"]:
+            from .maxherding import MaxHerding
+            delta = self.cfg.ACTIVE_LEARNING.INITIAL_DELTA
+            maxherding = MaxHerding(self.cfg, lSet, uSet, self.cfg.ACTIVE_LEARNING.BUDGET_SIZE, delta=delta)
+            activeSet, uSet = maxherding.select_samples()
+            # maxherding.plot_tsne()
 
         elif self.cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["dcom"]:
             from .DCoM import DCoM
@@ -117,3 +146,39 @@ class ActiveLearning:
 
         return activeSet, uSet
         
+
+    def choose_sampling_function(self):
+        if self.cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["prob_cover", 'probcover']:
+            from .prob_cover import ProbCover
+            probcov = ProbCover(self.cfg, lSet, uSet, budgetSize=self.cfg.ACTIVE_LEARNING.BUDGET_SIZE,
+                            delta=self.cfg.ACTIVE_LEARNING.INITIAL_DELTA)
+            activeSet, uSet = probcov.select_samples()
+            # probcov.plot_tsne()
+        elif self.cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["misp"]:
+            from .MISP import  MISP
+
+            misp = MISP(self.cfg, lSet, uSet, budgetSize=self.cfg.ACTIVE_LEARNING.BUDGET_SIZE,
+                        delta=self.cfg.ACTIVE_LEARNING.INITIAL_DELTA)
+            activeSet, uSet = misp.select_samples()
+            # misp.plot_tsne()
+
+        elif self.cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["mispc"]:
+            from .MISP_probcover import MISPC
+
+            misp = MISPC(self.cfg, lSet, uSet, budgetSize=self.cfg.ACTIVE_LEARNING.BUDGET_SIZE,
+                        delta=self.cfg.ACTIVE_LEARNING.INITIAL_DELTA)
+            activeSet, uSet = misp.select_samples()
+            # misp.plot_tsne()
+        elif self.cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["misp_plus"]:
+            from .MISP_plus import MISP_PLUS
+
+            mispp = MISP_PLUS(self.cfg, lSet, uSet, budgetSize=self.cfg.ACTIVE_LEARNING.BUDGET_SIZE, train_data=trainDataset,
+                        delta=self.cfg.ACTIVE_LEARNING.INITIAL_DELTA)
+            activeSet, uSet = mispp.select_samples()
+            # misp.plot_tsne()
+        elif self.cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["maxherding", "max_herding"]:
+            from .maxherding import MaxHerding
+            delta = self.cfg.ACTIVE_LEARNING.INITIAL_DELTA
+            maxherding = MaxHerding(self.cfg, lSet, uSet, self.cfg.ACTIVE_LEARNING.BUDGET_SIZE, delta=delta)
+            activeSet, uSet = maxherding.select_samples()
+            # maxherding.plot_tsne()
