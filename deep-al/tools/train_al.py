@@ -107,12 +107,17 @@ def argparser():
     parser.add_argument('--eval_model_type', help='eval_model_type', type=str) # train the eval model from features not images
     # parser.add_argument('--linear_from_features', help='Whether to use a linear layer from self-supervised features', action='store_true') # train the eval model from features not images
     parser.add_argument('--initial_delta', help='Relevant only for ProbCover and DCoM', default=0.6, type=float)
+    parser.add_argument('--kernel_type', default='rbf', type=str)
+    parser.add_argument('--diff_method', default='abs_diff', type=str)
+    parser.add_argument('--confidence_method', default='margin', type=str)
     parser.add_argument('--k_logistic', default=50, type=int)
     parser.add_argument('--a_logistic', default=0.8, type=float)
     parser.add_argument('--alpha', default=0.5, type=float)
+    parser.add_argument('--soft_border_val', default=0.5, type=float)
     parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--high_budget', action='store_true')
     parser.add_argument('--norm_importance', action='store_true')
-    parser.add_argument('--own_alpha_weighting', action='store_true')
+    parser.add_argument('--max_iter', default=32, type=int)
     return parser
 
 
@@ -202,7 +207,17 @@ def main(cfg):
             uSetPath=cfg.ACTIVE_LEARNING.USET_PATH, valSetPath = cfg.ACTIVE_LEARNING.VALSET_PATH)
     # model = model_builder.build_model(cfg).cuda()
     model = mh.get_model(cfg)
-    np.save(f"/cs/labs/daphna/itai.david/py_repos/TypiClust/results/t-sne/CIFAR10_t-sne_labels.npy", train_data.targets)
+    if cfg.HIGH_BUDGET:
+        seed = 42
+        rng = np.random.default_rng(seed)
+        lset_indices_from_uset = rng.choice(uSet.size, size=10000, replace=False)
+        lset_mask = np.zeros_like(uSet, dtype=bool)
+        lset_mask[lset_indices_from_uset] = True
+        lSet = uSet[lset_mask]
+        uSet = uSet[~lset_mask]
+
+    train_labels = train_data.targets
+    al_obj = ActiveLearning(data_obj, cfg, train_labels, lSet)
     if len(lSet) == 0:
         if cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ['dcom']:
             print('Labeled Set is Empty - Create and save the first delta values list')
@@ -211,7 +226,6 @@ def main(cfg):
             delta_avg_lst.append(cfg.ACTIVE_LEARNING.INITIAL_DELTA)
 
         print('Labeled Set is Empty - Sampling an Initial Pool')
-        al_obj = ActiveLearning(data_obj, cfg)
         activeSet, new_uSet = al_obj.sample_from_uSet(model, lSet, uSet, train_data)
         print(f'Initial Pool is {activeSet}')
         # Save current lSet, new_uSet and activeSet in the episode directory
@@ -272,7 +286,7 @@ def main(cfg):
         # Active Sample 
         lSet, lSet_loader, uSet, valSet_loader = active_sampling_part(cfg, checkpoint_file, cur_episode, data_obj, lSet,
                                                                       lSet_loader, train_data, uSet, valSet,
-                                                                      valSet_loader)
+                                                                      valSet_loader, al_obj)
 
         # add avg delta to cfg.ACTIVE_LEARNING.DELTA_LST towards the next active sampling
         if cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ['dcom']:
@@ -296,10 +310,10 @@ def main(cfg):
 
 
 def active_sampling_part(cfg, checkpoint_file, cur_episode, data_obj, lSet, lSet_loader, train_data, uSet, valSet,
-                         valSet_loader):
+                         valSet_loader, al_obj):
     print("======== ACTIVE SAMPLING ========\n")
     logger.info("======== ACTIVE SAMPLING ========\n")
-    al_obj = ActiveLearning(data_obj, cfg)
+    # al_obj = ActiveLearning(data_obj, cfg) if al_obj is None else al_obj
     # clf_model = model_builder.build_model(cfg)
     # clf_model = cu.load_checkpoint(checkpoint_file, clf_model)
     clf_model = mh.get_model(cfg, checkpoint_file)
@@ -732,7 +746,7 @@ def define_eval_model_type(cfg, debug=False):
         if debug:
             cfg.OPTIM.MAX_EPOCH = 1
         else:
-            cfg.OPTIM.MAX_EPOCH = 500
+            cfg.OPTIM.MAX_EPOCH = 200
 
 if __name__ == "__main__":
     # print(1)
@@ -742,21 +756,27 @@ if __name__ == "__main__":
     cfg.ACTIVE_LEARNING.SAMPLING_FN = args.al
     cfg.ACTIVE_LEARNING.BUDGET_SIZE = args.budget
     cfg.ACTIVE_LEARNING.INITIAL_DELTA = args.initial_delta
-    debug = cfg.DEBUG =  args.debug
+    cfg.KERNEL_TYPE = args.kernel_type
+    cfg.SOFT_BORDER_VAL = args.soft_border_val
+    cfg.DIFF_METHOD = args.diff_method
+    debug = cfg.DEBUG = args.debug
+    cfg.HIGH_BUDGET = args.high_budget
+    cfg.CONFIDENCE_METHOD = args.confidence_method
     if debug:
         cfg.RNG_SEED = 0
     else:
         cfg.RNG_SEED = args.seed
     cfg.ALPHA = args.alpha
     cfg.NORM_IMPORTANCE = args.norm_importance
-    cfg.OWN_ALPHA_WEIGHTING = args.own_alpha_weighting
+    # cfg.OWN_ALPHA_WEIGHTING = args.own_alpha_weighting
 
     print("RNG_SEED is set to {}".format(cfg.RNG_SEED))
     # cfg.MODEL.LINEAR_FROM_FEATURES = args.linear_from_features
     cfg.ACTIVE_LEARNING.A_LOGISTIC = args.a_logistic
     cfg.ACTIVE_LEARNING.K_LOGISTIC = args.k_logistic
     cfg.EVAL_MODEL_TYPE = args.eval_model_type
-    define_eval_model_type(cfg)
+    cfg.ACTIVE_LEARNING.MAX_ITER = args.max_iter
+    define_eval_model_type(cfg, debug)
 
     main(cfg)
 

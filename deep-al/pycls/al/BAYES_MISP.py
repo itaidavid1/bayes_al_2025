@@ -4,6 +4,8 @@ import torch
 import gc
 import pycls.datasets.utils as ds_utils
 from tools.utils import visualize_tsne
+import time
+from torch.profiler import profile, record_function, ProfilerActivity
 import matplotlib.pyplot as plt
 ###MISP = maximum importance sampling points
 torch.cuda.empty_cache()
@@ -44,7 +46,7 @@ class TopHatKernel(object):
             # distance comparisons are done in batches to reduce memory consumption
             x2_subset = x2[:, i * batch_size: (i + 1) * batch_size]
             dist = torch.cdist(x1, x2_subset)
-            dist = (dist < h).to(dtype=torch.float32)
+            dist = (dist < h).to(dtype=torch.float16)
             dist_matrix.append(dist.cpu())
             del dist
         dist_matrix = torch.cat(dist_matrix, dim=-1).squeeze(0)
@@ -52,28 +54,7 @@ class TopHatKernel(object):
         return dist_matrix
 
 
-class SoftTopHatKernel(object):
-    def __init__(self, device):
-        self.device = device
-
-    def compute_kernel(self, x1, x2, h, batch_size=512, slope=5):
-        x1, x2 = x1.unsqueeze(0).to(self.device), x2.unsqueeze(0).to(self.device) # 1 x n x d, 1 x n' x d
-        dist_matrix = []
-        batch_round = x2.shape[1] // batch_size + int(x2.shape[1] % batch_size > 0)
-        for i in range(batch_round):
-            # distance comparisons are done in batches to reduce memory consumption
-            x2_subset = x2[:, i * batch_size: (i + 1) * batch_size]
-            dist = torch.cdist(x1, x2_subset)
-            tophat_mask = (dist < h).to(dtype=torch.float16)
-            soft_border_mask = ((dist >= h) & (dist < h + self.soft_border_val)).to(dtype=torch.float16)
-            sig = 2 * torch.sigmoid(-slope * (dist - h) / self.soft_border_val)
-            dist = tophat_mask + soft_border_mask * sig
-            dist_matrix.append(dist.cpu())
-            del dist, sig, soft_border_mask, tophat_mask
-        dist_matrix = torch.cat(dist_matrix, dim=-1).squeeze(0)
-        return dist_matrix
-
-class ALL_MISP:
+class BAYES_MISP:
     def __init__(self, cfg, budgetSize, train_labels, lset, delta=1):
         self.cfg = cfg
         self.ds_name = self.cfg['DATASET']['NAME']
@@ -88,17 +69,16 @@ class ALL_MISP:
         self.soft_border_val = self.cfg.SOFT_BORDER_VAL if 'SOFT_BORDER_VAL' in self.cfg else 0.15
         self.diff_method = self.cfg.DIFF_METHOD if 'DIFF_METHOD' in self.cfg else 'abs_diff'
         kernel_type = self.cfg.KERNEL_TYPE if 'KERNEL_TYPE' in self.cfg else 'rbf'
-        if kernel_type == 'soft_tophat':
-            self.kernel_fn = SoftTopHatKernel('cuda')
-        elif kernel_type == 'tophat':
+        if kernel_type == 'tophat':
             self.kernel_fn = TopHatKernel('cuda')
         else:
             self.kernel_fn = RBFKernel('cuda')
 
         self.train_labels_general = np.array(train_labels)
         unique_labels = np.unique(self.train_labels_general)
-        self.C_general = torch.zeros((self.all_features.shape[0], unique_labels.size), device='cuda')
-        self.chosen_labels_num = torch.zeros(np.unique(self.train_labels_general).size).to('cuda')
+        self.C_general = torch.full((self.all_features.shape[0], unique_labels.size), self.alpha, device='cuda', dtype=torch.float16)
+        self.num_of_classes = np.unique(self.train_labels_general).size
+        self.chosen_labels_num = torch.zeros(self.num_of_classes).to('cuda')
         if lset is not None and lset.size > 0:
             temp_K = self.kernel_fn.compute_kernel(
                 torch.from_numpy(self.all_features), torch.from_numpy(self.all_features), self.delta).to('cuda')
@@ -119,8 +99,6 @@ class ALL_MISP:
             self.rel_features, self.rel_features, self.delta).to('cuda')
         self.C = self.C_general[self.relevant_indices].to('cuda')
         self.train_labels = self.train_labels_general[self.relevant_indices]
-
-
 
     def set_rel_features(self, lset, uset):
         self.lSet = lset
@@ -147,142 +125,26 @@ class ALL_MISP:
         for i in range(self.budgetSize):
 
             curr_l_set = np.concatenate((np.arange(len(self.lSet)), selected)).astype(int)
-            num_classes = self.chosen_labels_num.size(0)
-            class_sim_max = torch.zeros((num_classes, num_classes), device='cuda')
-            class_sim_mean = torch.zeros((num_classes, num_classes), device='cuda')
-            class_indices = {label: np.where(self.train_labels[curr_l_set] == label)[0] for label in range(num_classes)}
-
-            for c1 in range(num_classes):
-                for c2 in range(c1, num_classes):
-                    indices_c1 = class_indices.get(c1, [])
-                    indices_c2 = class_indices.get(c2, [])
-
-                    if not len(indices_c1) or not len(indices_c2):
-                        continue
-
-                    sim_submatrix = self.K[indices_c1, :][:, indices_c2]
-
-                    if c1 == c2:
-                        if len(indices_c1) > 1:
-                            # Exclude diagonal for intra-class similarity
-                            non_diagonal_mask = ~torch.eye(len(indices_c1), dtype=torch.bool,
-                                                           device=sim_submatrix.device)
-                            if non_diagonal_mask.any():
-                                class_sim_mean[c1, c1] = sim_submatrix[non_diagonal_mask].mean()
-                                class_sim_max[c1, c1] = sim_submatrix[non_diagonal_mask].max()
-                    else:
-                        mean_val = sim_submatrix.mean()
-                        max_val = sim_submatrix.max()
-                        class_sim_mean[c1, c2] = mean_val
-                        class_sim_mean[c2, c1] = mean_val
-                        class_sim_max[c1, c2] = max_val
-                        class_sim_max[c2, c1] = max_val
-
-
-            if self.diff_method == '2_closest_diff':
-                # C_softmax = torch.nn.functional.softmax(C_sum, dim=1)
-                # vals, inds = torch.topk(C_softmax, k=2, dim=1)
-                # C_diff = (vals[:, 0] - vals[:, 1])
-
-                # vals, inds = torch.topk(C_sum, k=2, dim=1)
-                # C_sum_per_point = torch.sum(C_sum, dim=1)
-                # C_diff = (vals[:, 0] - vals[:, 1]) / (C_sum_per_point + 1e-8)
-
+            C_sum = torch.sum(self.C, dim=1, keepdim=True)
+            norm_C = self.C / C_sum
+            if self.diff_method == 'margin':
                 vals, inds = torch.topk(self.C, k=2, dim=1)
-                C_sum_per_point = torch.sum(self.C, dim=1)
-                C_diff = (vals[:, 0] - vals[:, 1]) / (C_sum_per_point + 1e-8) if self.confidence_method == 'margin' else vals[:, 0] / (C_sum_per_point + 1e-8)
 
-                point_total_contribution = batched_diffs(self.K, C_diff, diff_method="abs_diff")
-            elif self.diff_method == '1_closest_diff':
-                C_diff = torch.max(self.C, dim=1).values
-                point_total_contribution = batched_diffs(self.K, C_diff, diff_method="abs_diff")
+                old_margin = vals[:, 0] - vals[:, 1]
 
-            elif self.diff_method == 'combine_uncert_type':
-                # vals, inds = torch.topk(self.C, k=2, dim=1)
-                # C_sum_per_point = torch.sum(self.C, dim=1)
-                # C_diff = (vals[:, 0] - vals[:, 1]) / (C_sum_per_point + 1e-8)
-                #
-                #
-                # C1 = vals[:, 0] / (self.chosen_labels_num[inds[:, 0]] + 1e-8)
-                # C2 = vals[:, 1] / (self.chosen_labels_num[inds[:, 1]] + 1e-8)
-                # J = 2 * (C1 * C2) / (C1 + C2 + 1e-8)
-                # margin = C1 - C2
-                # U = (1 - margin) * J
-                # point_total_contribution = batched_diffs(self.K, C1, diff_method="abs_diff", U=U)
+                point_total_contribution = batched_diffs(self.K, old_margin, self.alpha, self.num_of_classes, diff_method="margin")
+            elif self.diff_method == 'max':
+                max_vals, indices = torch.max(norm_C, dim=1)
+                point_total_contribution = batched_diffs(self.K, max_vals, self.alpha, self.num_of_classes, diff_method="max")
 
-                vals_new, inds_new = torch.topk(self.C / (self.chosen_labels_num + 1e-8) , k=2, dim=1)
-                C1_new = vals_new[:, 0]
-                C2_new = vals_new[:, 1]
-
-                J_new = 2 * (C1_new * C2_new) / (C1_new + C2_new + 1e-8)
-                margin_new = C1_new - C2_new
-                U_new = (1 - margin_new) * J_new
-                point_total_contribution = batched_diffs(self.K, C1_new, diff_method="combine_uncert_type", U=U_new)
-
-            elif self.diff_method == 'combine_uncert_type_U0':
-                vals_new, inds_new = torch.topk(self.C / (self.chosen_labels_num + 1e-8) , k=2, dim=1)
-                C1_new = vals_new[:, 0]
-                point_total_contribution = batched_diffs(self.K, C1_new, diff_method="abs_diff")
-
-            elif self.diff_method == 'combine_uncert_type_U2':
-                vals_new, inds_new = torch.topk(self.C / (self.chosen_labels_num + 1e-8) , k=2, dim=1)
-                C1_new = vals_new[:, 0]
-                C2_new = vals_new[:, 1]
-
-                J_new = 2 * (C1_new * C2_new) / (C1_new + C2_new + 1e-8)
-                margin_new = C1_new - C2_new
-                U_new = (1 - margin_new) * J_new
-                point_total_contribution = batched_diffs(self.K, C1_new, diff_method="combine_uncert_type", U=U_new**2)
-
-
-            elif self.diff_method == 'combine_uncert_type_J2':
-                vals_new, inds_new = torch.topk(self.C / (self.chosen_labels_num + 1e-8) , k=2, dim=1)
-                C1_new = vals_new[:, 0]
-                C2_new = vals_new[:, 1]
-
-                J_new = 2 * (C1_new * C2_new) / (C1_new + C2_new + 1e-8)
-                margin_new = C1_new - C2_new
-                U_new = (1 - margin_new) * J_new**2
-                point_total_contribution = batched_diffs(self.K, C1_new, diff_method="combine_uncert_type", U=U_new)
-
-            elif self.diff_method == 'combine_uncert_type_outer':
-                vals_new, inds_new = torch.topk(self.C, k=2, dim=1)
-                C1_new = vals_new[:, 0]
-                C2_new = vals_new[:, 1]
-
-                J_new = 2 * (C1_new * C2_new) / (C1_new + C2_new + 1e-8)
-                margin_new = C1_new - C2_new
-                U_new = (1 - margin_new) * J_new
-                point_total_contribution_from_others = batched_diffs(self.K, C1_new, diff_method="abs_diff")
-
-                corr_factor = (class_sim_max[inds_new[:, 0], inds_new[:, 1]] - class_sim_mean[inds_new[:, 0], inds_new[:, 1]])
-                point_total_contribution = point_total_contribution_from_others + corr_factor * U_new
-
-            elif self.diff_method == 'combine_uncert_type_outer_mean':
-                vals_new, inds_new = torch.topk(self.C / (self.chosen_labels_num + 1e-8), k=2, dim=1)
-                C1_new = vals_new[:, 0]
-                C2_new = vals_new[:, 1]
-
-                J_new = 2 * (C1_new * C2_new) / (C1_new + C2_new + 1e-8)
-                margin_new = C1_new - C2_new
-                U_new = (1 - margin_new) * J_new
-                point_total_contribution_from_others = batched_diffs(self.K, C1_new, diff_method="abs_diff")
-
-                corr_factor = (class_sim_max[inds_new[:, 0], inds_new[:, 1]] - class_sim_mean[inds_new[:, 0], inds_new[:, 1]])
-                point_total_contribution = point_total_contribution_from_others + corr_factor * U_new
-
-            elif self.diff_method == 'prob_method_v1':
-                if i > 0:
-                    vals_new, inds_new = torch.topk(self.C / i, k=2, dim=1)
-                    C1_new = vals_new[:, 0]
-                    C2_new = vals_new[:, 1]
-                else:
-                    C1_new = C2_new = torch.zeros(self.C.size(0)).to(device=self.C.device)
-                J_new = 2 * (C1_new * C2_new) / (C1_new + C2_new + 1e-8)
-                margin_new = C1_new - C2_new
-                U_new = (1 - margin_new) * J_new
-                point_total_contribution = batched_diffs(self.K, C1_new, diff_method="abs_diff")
-
+            elif self.diff_method == 'weighted_max':
+                # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+                #     with record_function("model_inference"):
+                #         point_total_contribution = batched_diffs_weighted(self.K, self.C, self.alpha, self.num_of_classes, diff_method="weighted_max")
+                start = time.time()
+                point_total_contribution = batched_diffs_weighted(self.K, self.C, self.alpha, self.num_of_classes, diff_method="weighted_max")
+                print(time.time() - start)
+                # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
             else:
                 point_total_contribution = batched_diffs(self.K, self.C, diff_method=self.diff_method)
             point_total_contribution[curr_l_set] = -np.inf
@@ -292,19 +154,10 @@ class ALL_MISP:
             self.chosen_labels_num[chosen_label] += 1
 
             self.C[:, chosen_label] += self.K[sampled_point]
-            # self.C[:, chosen_label] = torch.maximum(self.K[sampled_point], self.C[:, chosen_label])
-            if self.diff_method == 'prob_method_v1':
-                c_prob = (1 - self.K[sampled_point]) / (self.K.size(0) - 1)
-                c_prob_mask = torch.ones(self.C.size(1), dtype=torch.bool)
-                c_prob_mask[chosen_label] = False
-                self.C[:, c_prob_mask] += c_prob.repeat(99, 1).T
-
-
 
             assert sampled_point not in selected, 'sample was already selected'
             selected.append(sampled_point)
 
-            # vals, inds = torch.topk(C_sum[l], k=2, dim=1)
 
 
         if False:
@@ -330,7 +183,7 @@ class ALL_MISP:
         sampled_indices = np.array(self.activeSet).astype(int)
         visualize_tsne(labeled_indices, sampled_indices, algo_name='MISP')
 
-def batched_diffs(K, C, chunk_size=1024, diff_method="abs_diff", U=None):
+def batched_diffs(K, C, alpha, number_of_classes, chunk_size=1024, diff_method="abs_diff"):
     D, N = K.shape
     result = torch.empty(D).to(device=C.device)
     for start in range(0, N, chunk_size):
@@ -338,19 +191,38 @@ def batched_diffs(K, C, chunk_size=1024, diff_method="abs_diff", U=None):
         if diff_method == "abs_diff":
             result[start:end] = torch.sum(torch.maximum(K[start:end] - C, torch.zeros_like(K[start:end]).to(device=C.device)), dim=1)
         elif diff_method == "max":
-            # find places K > C
-            pos_mask = K[start:end] > C
-            temp_K = K[start:end]
-            temp_K[~pos_mask] = 0
-            result[start:end] = torch.sum(temp_K, dim=1)
-            del pos_mask, temp_K
-        elif diff_method == "combine_uncert_type":
-            if U is None:
-                raise ValueError("U must be provided for combine_uncert_type method")
-
             result[start:end] = torch.sum(
-                torch.maximum((K[start:end] - C) + (K[start:end] * U), torch.zeros_like(K[start:end]).to(device=C.device)), dim=1)
+                torch.maximum(((K[start:end] + alpha) / (K[start:end] + alpha * number_of_classes)) - C, torch.zeros_like(K[start:end]).to(device=C.device)), dim=1)
+        elif diff_method == 'margin':
+            result[start:end] = torch.sum(
+                torch.maximum((K[start:end] / (K[start:end] + alpha * number_of_classes)) - C, torch.zeros_like(K[start:end]).to(device=C.device)), dim=1)
         else:
             raise ValueError(f"Unknown diff method: {diff_method}")
-    # del vals, inds
+    return result
+# @torch.compile(backend="cudagraphs")
+def batched_diffs_weighted(K, C, alpha, number_of_classes, chunk_size=32, diff_method="abs_diff"):
+    D, N = K.shape
+    result = torch.empty(D).to(device=C.device)
+    max_C = torch.max(C, axis=1, keepdim=True).values
+    sum_C = torch.sum(C, axis=1, keepdim=True)
+    old_max = (max_C.squeeze() / sum_C.squeeze()).unsqueeze(1)
+    norm_C = (C / sum_C).unsqueeze(1)
+    num_iterations = N // 100
+    K = K.unsqueeze(2)
+    # timing each iteration
+    for i in range(0, num_iterations, chunk_size):
+        if diff_method == "weighted_max":
+            end = i + chunk_size
+            K_batched = K[i:end]
+            future_sum = K_batched + sum_C
+            modified_C = C + K[i:end]
+            new_maxes = torch.maximum(max_C, modified_C)
+            f_vecs = new_maxes / future_sum
+
+            point_diff = f_vecs - old_max
+            point_diff.clamp_(min=0)
+            weighted_point_diff = torch.bmm(norm_C[i:end], point_diff.permute(0, 2, 1))
+            result[i:end] = torch.nansum(weighted_point_diff, dim=2)[:,0]
+        else:
+            raise ValueError(f"Unknown diff method: {diff_method}")
     return result

@@ -7,20 +7,32 @@ import matplotlib.pyplot as plt
 from tools.utils import visualize_tsne
 
 class ProbCover:
-    def __init__(self, cfg, lSet, uSet, budgetSize, delta):
+    def __init__(self, cfg, budgetSize, delta):
         self.cfg = cfg
         self.ds_name = self.cfg['DATASET']['NAME']
         self.seed = self.cfg['RNG_SEED']
         self.all_features = ds_utils.load_features(self.ds_name, self.seed)
-        self.lSet = lSet
-        self.uSet = uSet
         self.budgetSize = budgetSize
         self.delta = delta
-        self.relevant_indices = np.concatenate([self.lSet, self.uSet]).astype(int)
-        self.rel_features = self.all_features[self.relevant_indices]
+        # self.lSet = lSet
+        # self.uSet = uSet
+        # self.relevant_indices = np.concatenate([self.lSet, self.uSet]).astype(int)
+        # self.rel_features = self.all_features[self.relevant_indices]
+        # self.graph_df = self.construct_graph()
+        # self.activeSet = []
+        # print(self.lSet)
+
+    def init_sampling_loop(self,lset, uset):
+        self.set_rel_features(lset, uset)
         self.graph_df = self.construct_graph()
         self.activeSet = []
-        print(self.lSet)
+
+    def set_rel_features(self, lset, uset):
+        self.lSet = lset
+        self.uSet = uset
+        print(lset)
+        self.relevant_indices = np.concatenate([self.lSet, self.uSet]).astype(int)
+        self.rel_features = self.all_features[self.relevant_indices]
 
     def construct_graph(self, batch_size=500):
         """
@@ -54,7 +66,7 @@ class ProbCover:
         print(f'Graph contains {len(df)} edges.')
         return df
 
-    def select_samples(self):
+    def select_samples(self, lset, uset):
         """
         selecting samples using the greedy algorithm.
         iteratively:
@@ -62,6 +74,8 @@ class ProbCover:
         - selects the sample high the highest out degree (covers most new samples)
 
         """
+        self.init_sampling_loop(lset, uset)
+
         print(f'Start selecting {self.budgetSize} samples.')
         selected = []
         # removing incoming edges to all covered samples from the existing labeled set

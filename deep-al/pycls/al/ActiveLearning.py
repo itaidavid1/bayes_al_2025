@@ -12,11 +12,12 @@ class ActiveLearning:
     Implements standard active learning methods.
     """
 
-    def __init__(self, dataObj, cfg):
+    def __init__(self, dataObj, cfg, train_labels=None, lset=None):
         self.dataObj = dataObj
         self.sampler = Sampling(dataObj=dataObj,cfg=cfg)
         self.cfg = cfg
-        
+        self.sampling_fn = self.choose_sampling_function(train_labels, lset)
+
     def sample_from_uSet(self, clf_model, lSet, uSet, trainDataset, supportingModels=None):
         """
         Sample from uSet using cfg.ACTIVE_LEARNING.SAMPLING_FN.
@@ -34,6 +35,11 @@ class ActiveLearning:
         assert self.cfg.ACTIVE_LEARNING.BUDGET_SIZE > 0, "Expected a positive budgetSize"
         assert self.cfg.ACTIVE_LEARNING.BUDGET_SIZE < len(uSet), "BudgetSet cannot exceed length of unlabelled set. Length of unlabelled set: {} and budgetSize: {}"\
         .format(len(uSet), self.cfg.ACTIVE_LEARNING.BUDGET_SIZE)
+
+        if self.sampling_fn is not None:
+            logger.info(f"Using {self.cfg.ACTIVE_LEARNING.SAMPLING_FN} sampling function for active learning.")
+            return self.sampling_fn.select_samples(lSet, uSet)
+
 
         if self.cfg.ACTIVE_LEARNING.SAMPLING_FN == "random":
 
@@ -147,38 +153,38 @@ class ActiveLearning:
         return activeSet, uSet
         
 
-    def choose_sampling_function(self):
+    def choose_sampling_function(self, train_labels=None, lset=None):
         if self.cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["prob_cover", 'probcover']:
             from .prob_cover import ProbCover
-            probcov = ProbCover(self.cfg, lSet, uSet, budgetSize=self.cfg.ACTIVE_LEARNING.BUDGET_SIZE,
+            probcov = ProbCover(self.cfg, budgetSize=self.cfg.ACTIVE_LEARNING.BUDGET_SIZE,
                             delta=self.cfg.ACTIVE_LEARNING.INITIAL_DELTA)
-            activeSet, uSet = probcov.select_samples()
+            return probcov
+            activeSet, uSet = probcov.select_samples(lSet, uSet)
             # probcov.plot_tsne()
         elif self.cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["misp"]:
             from .MISP import  MISP
 
-            misp = MISP(self.cfg, lSet, uSet, budgetSize=self.cfg.ACTIVE_LEARNING.BUDGET_SIZE,
+            misp = MISP(self.cfg, budgetSize=self.cfg.ACTIVE_LEARNING.BUDGET_SIZE,
                         delta=self.cfg.ACTIVE_LEARNING.INITIAL_DELTA)
-            activeSet, uSet = misp.select_samples()
-            # misp.plot_tsne()
+            return misp
+        elif self.cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["max_misp"]:
+            from .MAX_MISP import  MAX_MISP
 
-        elif self.cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["mispc"]:
-            from .MISP_probcover import MISPC
-
-            misp = MISPC(self.cfg, lSet, uSet, budgetSize=self.cfg.ACTIVE_LEARNING.BUDGET_SIZE,
+            max_misp = MAX_MISP(self.cfg, budgetSize=self.cfg.ACTIVE_LEARNING.BUDGET_SIZE,
                         delta=self.cfg.ACTIVE_LEARNING.INITIAL_DELTA)
-            activeSet, uSet = misp.select_samples()
-            # misp.plot_tsne()
-        elif self.cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["misp_plus"]:
-            from .MISP_plus import MISP_PLUS
+            return max_misp
 
-            mispp = MISP_PLUS(self.cfg, lSet, uSet, budgetSize=self.cfg.ACTIVE_LEARNING.BUDGET_SIZE, train_data=trainDataset,
-                        delta=self.cfg.ACTIVE_LEARNING.INITIAL_DELTA)
-            activeSet, uSet = mispp.select_samples()
-            # misp.plot_tsne()
-        elif self.cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["maxherding", "max_herding"]:
-            from .maxherding import MaxHerding
-            delta = self.cfg.ACTIVE_LEARNING.INITIAL_DELTA
-            maxherding = MaxHerding(self.cfg, lSet, uSet, self.cfg.ACTIVE_LEARNING.BUDGET_SIZE, delta=delta)
-            activeSet, uSet = maxherding.select_samples()
-            # maxherding.plot_tsne()
+        elif self.cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["all_misp"]:
+            from .ALL_MISP import  ALL_MISP
+
+            all_misp = ALL_MISP(self.cfg, budgetSize=self.cfg.ACTIVE_LEARNING.BUDGET_SIZE,
+                        train_labels= train_labels, delta=self.cfg.ACTIVE_LEARNING.INITIAL_DELTA, lset=lset)
+            return all_misp
+
+        elif self.cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["bayes_misp"]:
+            from .BAYES_MISP import BAYES_MISP
+
+            bayes_misp = BAYES_MISP(self.cfg, budgetSize=self.cfg.ACTIVE_LEARNING.BUDGET_SIZE,
+                        train_labels= train_labels, delta=self.cfg.ACTIVE_LEARNING.INITIAL_DELTA, lset=lset)
+            return bayes_misp
+
