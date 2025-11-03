@@ -21,8 +21,9 @@ class DCoM:
         self.budgetSize = budgetSize
         self.max_delta = max_delta
         self.relevant_indices = np.concatenate([self.lSet, self.uSet]).astype(int)  # indices of lSet and then uSet in all_features
+        # self.relevant_indices = np.arange(self.lSet.size +self.uSet.size).astype(int)  # indices of lSet and then uSet in all_features
         self.rel_features = self.all_features[self.relevant_indices]  # features of lSet and then uSet
-        self.lSet_deltas = [np.float(delta) for delta in lSet_deltas]
+        self.lSet_deltas = [float(delta) for delta in lSet_deltas]
         self.lSet_deltas_dict = dict(zip(np.arange(len(self.lSet)), self.lSet_deltas))
         self.delta_avg = np.average(self.lSet_deltas)
 
@@ -60,7 +61,7 @@ class DCoM:
         print(f'Before delete lSet neighbors: Graph contains {len(df)} edges.')
         return df
 
-    def construct_graph(self, delta=None, batch_size=700):
+    def construct_graph(self, delta=None, batch_size=500):
         """
          Creates a directed graph where:
          x -> y if l2(x, y) < delta, and deletes the covered points using lSet_deltas.
@@ -77,10 +78,12 @@ class DCoM:
 
         # removing incoming edges to all cover from the existing labeled set
         edges_from_lSet_in_ball = np.isin(df.x, np.arange(len(self.lSet))) & (df.d < df.x.map(self.lSet_deltas_dict))
+        # edges_from_lSet_in_ball = np.isin(df.x, self.lSet) & (df.d < df.x.map(self.lSet_deltas_dict))
         covered_samples = df.y[edges_from_lSet_in_ball].unique()
 
         edges_to_covered_samples = np.isin(df.y, covered_samples)
         all_edges_from_lSet = np.isin(df.x, np.arange(len(self.lSet)))
+        # all_edges_from_lSet = np.isin(df.x, self.lSet)
 
         mask = all_edges_from_lSet | edges_to_covered_samples  # all the points inside the balls
         df_filtered = df[~mask]
@@ -114,9 +117,12 @@ class DCoM:
         del fully_graph
 
         competence_score = get_competence_score(current_coverage)
+        # competence_score = 0
 
         margin = self.calculate_margin(model, train_data, data_obj)
         margin[0: len(self.lSet)] = 0 # We define the margin score to be 1-margin (as described in our paper)
+        # if self.lSet.size>0:
+        #     margin[self.lSet.astype(int)] = 0 # We define the margin score to be 1-margin (as described in our paper)
 
         cur_df, covered_samples = self.construct_graph(self.delta_avg)
 
@@ -128,7 +134,9 @@ class DCoM:
             else:
                 # calculate density for each point
                 ranks = self.calculate_density(cur_df)
-
+            # cur_chose = np.concatenate((self.lSet.astype(int), selected)).astype(int)
+            # if cur_chose.size > 0:
+            #     ranks[cur_chose] = -1
             cur_selection = DCoM.normalize_and_maximize(ranks, margin, 1, lambda r, e: competence_score * e + (1 - competence_score) * r)[0]
             print(f'Iteration is {i}.\tGraph has {len(cur_df)} edges.\tCoverage is {coverage:.3f}. \tCurr choice is {cur_selection}. \tcompetence_score={competence_score}')
 
@@ -176,6 +184,7 @@ class DCoM:
 
         fully_df = self.construct_graph_excluding_lSet(self.max_delta)
         covered_samples = fully_df.y[np.isin(fully_df.x, np.arange(len(self.lSet))) & (
+        # covered_samples = fully_df.y[np.isin(fully_df.x, self.lSet) & (
                 fully_df.d < fully_df.x.map(self.lSet_deltas_dict))].unique()
         coverage = len(covered_samples) / len(self.relevant_indices)
 
@@ -216,7 +225,7 @@ class DCoM:
             print("---------------------------------------------------------------------------")
             new_deltas.append(str(round(mid_del_val, 2)))
 
-        self.lSet_deltas = [np.float(delta) for delta in new_deltas]
+        self.lSet_deltas = [float(delta) for delta in new_deltas]
         self.lSet_deltas_dict = dict(zip(np.arange(len(self.lSet)), self.lSet_deltas))
         print("All new deltas: ", new_deltas, '\n')
         return new_deltas
@@ -276,7 +285,7 @@ class DCoM:
         # Calculate the product using the provided target_func
         product_array = target_func(param1_normalized.flatten(), param2_normalized.flatten())
 
-        sorted_indices = np.argsort(product_array)[::-1]
+        sorted_indices = np.argsort(product_array, kind='stable')[::-1]
 
         return sorted_indices[:amount]
 

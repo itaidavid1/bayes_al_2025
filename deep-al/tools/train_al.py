@@ -110,6 +110,7 @@ def argparser():
     parser.add_argument('--kernel_type', default='rbf', type=str)
     parser.add_argument('--diff_method', default='abs_diff', type=str)
     parser.add_argument('--confidence_method', default='margin', type=str)
+    parser.add_argument('--cont_method', default='positive', type=str)
     parser.add_argument('--k_logistic', default=50, type=int)
     parser.add_argument('--a_logistic', default=0.8, type=float)
     parser.add_argument('--alpha', default=0.5, type=float)
@@ -117,6 +118,8 @@ def argparser():
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('--high_budget', action='store_true')
     parser.add_argument('--norm_importance', action='store_true')
+    parser.add_argument('--sparse_ds', action='store_true')
+    parser.add_argument('--decrease_alpha', action='store_true')
     parser.add_argument('--max_iter', default=32, type=int)
     return parser
 
@@ -192,6 +195,19 @@ def main(cfg):
     data_obj = Data(cfg)
     train_data, train_size = data_obj.getDataset(save_dir=cfg.DATASET.ROOT_DIR, isTrain=True, isDownload=True)
     test_data, test_size = data_obj.getDataset(save_dir=cfg.DATASET.ROOT_DIR, isTrain=False, isDownload=True)
+
+    if cfg.SPARSE_DS:
+        train_spare_inds = np.sort(np.load(f"/cs/labs/daphna/itai.david/py_repos/TypiClust/results/t-sne/{cfg['DATASET']['NAME']}_train_sparse_indices.npy"))
+        test_spare_inds = np.sort(np.load(f"/cs/labs/daphna/itai.david/py_repos/TypiClust/results/t-sne/{cfg['DATASET']['NAME']}_test_sparse_indices.npy"))
+
+        train_data.features = train_data.features[train_spare_inds.astype(int)]
+        train_data.targets = np.array(train_data.targets)[train_spare_inds].tolist()
+        train_data.data = train_data.data[train_spare_inds.astype(int)]
+
+        test_data.features = test_data.features[test_spare_inds]
+        test_data.targets = np.array(test_data.targets)[test_spare_inds].tolist()
+        test_data.data = test_data.data[test_spare_inds.astype(int)]
+
     cfg.ACTIVE_LEARNING.INIT_L_RATIO = args.initial_size / train_size
     print("\nDataset {} Loaded Sucessfully.\nTotal Train Size: {} and Total Test Size: {}\n".format(cfg.DATASET.NAME, train_size, test_size))
     logger.info("Dataset {} Loaded Sucessfully. Total Train Size: {} and Total Test Size: {}\n".format(cfg.DATASET.NAME, train_size, test_size))
@@ -242,6 +258,9 @@ def main(cfg):
     valSet_loader = data_obj.getIndexesDataLoader(indexes=valSet, batch_size=cfg.TRAIN.BATCH_SIZE, data=train_data)
     test_loader = data_obj.getTestLoader(data=test_data, test_batch_size=cfg.TRAIN.BATCH_SIZE, seed_id=cfg.RNG_SEED)
 
+    if valSet_loader is None:
+        valSet_loader = lSet_loader
+
     # Initialize the model.  
     print("model: {}\n".format(cfg.MODEL.TYPE))
     logger.info("model: {}\n".format(cfg.MODEL.TYPE))
@@ -290,7 +309,7 @@ def main(cfg):
 
         # add avg delta to cfg.ACTIVE_LEARNING.DELTA_LST towards the next active sampling
         if cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ['dcom']:
-            delta_lst_float = [np.float(delta) for delta in cfg.ACTIVE_LEARNING.DELTA_LST]
+            delta_lst_float = [float(delta) for delta in cfg.ACTIVE_LEARNING.DELTA_LST]
             next_initial_deltas = [str(round(np.average(delta_lst_float), 2))] * cfg.ACTIVE_LEARNING.BUDGET_SIZE
             cfg.ACTIVE_LEARNING.DELTA_LST.extend(next_initial_deltas)
             print("Current delta list: ", cfg.ACTIVE_LEARNING.DELTA_LST)
@@ -325,6 +344,8 @@ def active_sampling_part(cfg, checkpoint_file, cur_episode, data_obj, lSet, lSet
     uSet = new_uSet
     lSet_loader = data_obj.getIndexesDataLoader(indexes=lSet, batch_size=cfg.TRAIN.BATCH_SIZE, data=train_data)
     valSet_loader = data_obj.getIndexesDataLoader(indexes=valSet, batch_size=cfg.TRAIN.BATCH_SIZE, data=train_data)
+    if valSet_loader is None:
+        valSet_loader = lSet_loader
     # uSet_loader = data_obj.getSequentialDataLoader(indexes=uSet, batch_size=cfg.TRAIN.BATCH_SIZE, data=train_data)
     print(
         "Active Sampling Complete. After Episode {}:\nNew Labeled Set: {}, New Unlabeled Set: {}, Active Set: {}\n".format(
@@ -376,7 +397,7 @@ def Dcom_delta_update(cfg, data_obj, checkpoint_file, lSet, train_data, uSet):
                                                                               pseudo_labels=images_pseudo_labels,
                                                                               budget=cfg.ACTIVE_LEARNING.BUDGET_SIZE)
 
-        delta_lst_float = [np.float(delta) for delta in cfg.ACTIVE_LEARNING.DELTA_LST]
+        delta_lst_float = [float(delta) for delta in cfg.ACTIVE_LEARNING.DELTA_LST]
         delta_avg_lst.append(np.average(delta_lst_float))
         delta_std_lst.append(np.std(delta_lst_float))
 
@@ -759,6 +780,8 @@ if __name__ == "__main__":
     cfg.KERNEL_TYPE = args.kernel_type
     cfg.SOFT_BORDER_VAL = args.soft_border_val
     cfg.DIFF_METHOD = args.diff_method
+    cfg.CONT_METHOD = args.cont_method
+    cfg.DECREASING_ALPHA = args.decrease_alpha
     debug = cfg.DEBUG = args.debug
     cfg.HIGH_BUDGET = args.high_budget
     cfg.CONFIDENCE_METHOD = args.confidence_method
@@ -768,6 +791,7 @@ if __name__ == "__main__":
         cfg.RNG_SEED = args.seed
     cfg.ALPHA = args.alpha
     cfg.NORM_IMPORTANCE = args.norm_importance
+    cfg.SPARSE_DS = args.sparse_ds
     # cfg.OWN_ALPHA_WEIGHTING = args.own_alpha_weighting
 
     print("RNG_SEED is set to {}".format(cfg.RNG_SEED))

@@ -30,7 +30,9 @@ DATASET_FEATURES_DICT = {
             'IMAGENET50': '/cs/labs/daphna/itai.david/representations_bank/imagenet_dinov2/train_features.npy',
             'IMAGENET100': '/cs/labs/daphna/itai.david/representations_bank/imagenet_dinov2/train_features.npy',
             'IMAGENET200': '/cs/labs/daphna/itai.david/representations_bank/imagenet_dinov2/train_features.npy',
-            'IMAGENET': '/cs/labs/daphna/itai.david/representations_bank/imagenet_dinov2/train_features.npy'
+            'IMAGENET': '/cs/labs/daphna/itai.david/representations_bank/imagenet_dinov2/train_features.npy',
+            'SCENARIO_A': f"/cs/labs/daphna/itai.david/py_repos/points_A.txt",
+            'HALF_MOON': f"/cs/labs/daphna/itai.david/py_repos/points_HALF_MOON_2.txt",
         },
     'test':
         {
@@ -40,7 +42,9 @@ DATASET_FEATURES_DICT = {
             'IMAGENET50': '/cs/labs/daphna/itai.david/representations_bank/imagenet_dinov2/val_features.npy',
             'IMAGENET100': '/cs/labs/daphna/itai.david/representations_bank/imagenet_dinov2/val_features.npy',
             'IMAGENET200': '/cs/labs/daphna/itai.david/representations_bank/imagenet_dinov2/val_features.npy',
-            'IMAGENET': '/cs/labs/daphna/itai.david/representations_bank/imagenet_dinov2/val_features.npy'
+            'IMAGENET': '/cs/labs/daphna/itai.david/representations_bank/imagenet_dinov2/val_features.npy',
+            'SCENARIO_A': f"/cs/labs/daphna/itai.david/py_repos/TEST_points_A.txt",
+            'HALF_MOON': f"/cs/labs/daphna/itai.david/py_repos/TEST_points_HALF_MOON_2.txt",
         }
 }
 
@@ -52,6 +56,9 @@ def load_features(ds_name, seed=1, train=True, normalized=True):
         features = np.load(fname)
     elif fname.endswith('.pth'):
         features = torch.load(fname)
+    elif fname.endswith('.txt'):
+        normalized = False
+        features = np.loadtxt(fname)[:, :2].astype(np.float32)
     else:
         raise Exception("Unsupported filetype")
     if normalized:

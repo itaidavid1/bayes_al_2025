@@ -85,6 +85,7 @@ def build_model(cfg):
 
     elif cfg.MODEL.LINEAR_FROM_FEATURES:
         num_features = 384 if cfg.DATASET.NAME in ['IMAGENET50', 'IMAGENET100', 'IMAGENET200'] else 512
+        num_features = 2 if cfg.DATASET.NAME in ['SCENARIO_A', 'HALF_MOON'] else num_features
         return FeaturesNet(num_features, cfg.MODEL.NUM_CLASSES).cuda()
 
     model = get_model(cfg)(num_classes=cfg.MODEL.NUM_CLASSES, use_dropout=True)

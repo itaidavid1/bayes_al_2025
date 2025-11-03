@@ -3,6 +3,7 @@ import torchvision
 from PIL import Image
 import numpy as np
 import pycls.datasets.utils as ds_utils
+from torchvision.datasets import VisionDataset
 
 
 class CIFAR10(torchvision.datasets.CIFAR10):
@@ -166,3 +167,55 @@ class SVHN(torchvision.datasets.SVHN):
 
 
         return img, target
+
+
+class SCENARIO_A(VisionDataset):
+    def __init__(self, X, y, transform=None, target_transform=None):
+        super().__init__(root="", transform=transform, target_transform=target_transform)
+        self.features = X  # shape: (N, 2)
+        self.targets = y     # labels
+    def __len__(self):
+        return self.features.shape[0]
+
+    def __getitem__(self, idx):
+        x = self.features[idx]   # tensor shape: (2,)
+        t = self.targets[idx]
+        if self.transform is not None:
+            x = self.transform(x)
+        if self.target_transform is not None:
+            t = self.target_transform(t)
+        return x, t
+
+class HALF_MOON(VisionDataset):
+    def __init__(self, X, y, transform=None, target_transform=None):
+        super().__init__(root="", transform=transform, target_transform=target_transform)
+        self.features = X  # shape: (N, 2)
+        self.targets = y     # labels
+    def __len__(self):
+        return self.features.shape[0]
+
+    def __getitem__(self, idx):
+        x = self.features[idx]   # tensor shape: (2,)
+        t = self.targets[idx]
+        if self.transform is not None:
+            x = self.transform(x)
+        if self.target_transform is not None:
+            t = self.target_transform(t)
+        return x, t
+
+class CIFAR10_SPARSE(VisionDataset):
+    def __init__(self, X, y, transform=None, target_transform=None):
+        super().__init__(root="", transform=transform, target_transform=target_transform)
+        self.features = X  # shape: (N, 2)
+        self.targets = y     # labels
+    def __len__(self):
+        return self.features.shape[0]
+
+    def __getitem__(self, idx):
+        x = self.features[idx]   # tensor shape: (2,)
+        t = self.targets[idx]
+        if self.transform is not None:
+            x = self.transform(x)
+        if self.target_transform is not None:
+            t = self.target_transform(t)
+        return x, t

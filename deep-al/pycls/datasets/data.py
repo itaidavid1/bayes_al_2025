@@ -12,7 +12,7 @@ from torch.utils.data.sampler import SubsetRandomSampler
 from .randaugment import RandAugmentPolicy
 from .simclr_augment import get_simclr_ops
 import pycls.utils.logging as lu
-from pycls.datasets.custom_datasets import CIFAR10, CIFAR100, MNIST, SVHN
+from pycls.datasets.custom_datasets import CIFAR10, CIFAR100, MNIST, SVHN, SCENARIO_A, HALF_MOON
 from pycls.datasets.imbalanced_cifar import IMBALANCECIFAR10, IMBALANCECIFAR100
 from pycls.datasets.sampler import IndexedSequentialSampler
 from pycls.datasets.tiny_imagenet import TinyImageNet
@@ -121,7 +121,7 @@ class Data:
             norm_mean = []
             norm_std = []
 
-            if self.dataset in ["CIFAR10", "CIFAR100", 'IMBALANCED_CIFAR10', 'IMBALANCED_CIFAR100']:
+            if self.dataset in ["CIFAR10", "CIFAR100", 'IMBALANCED_CIFAR10', 'IMBALANCED_CIFAR100', "CIFAR10_SPARSE"]:
                 ops = [transforms.RandomCrop(32, padding=4)]
                 norm_mean = [0.4914, 0.4822, 0.4465]
                 norm_std = [0.247 , 0.2435, 0.2616]
@@ -145,6 +145,9 @@ class Data:
                 ops = [transforms.RandomCrop(32, padding=4)]
                 norm_mean = [0.4376, 0.4437, 0.4728]
                 norm_std = [0.1980, 0.2010, 0.1970]
+            elif self.dataset in ["SCENARIO_A", "HALF_MOON"]:
+                pass
+
             else:
                 raise NotImplementedError
 
@@ -249,6 +252,27 @@ class Data:
         elif self.dataset ==  'IMBALANCED_CIFAR100':
             im_cifar100 = IMBALANCECIFAR100(save_dir, train=isTrain, transform=preprocess_steps, test_transform=test_preprocess_steps)
             return im_cifar100, len(im_cifar100)
+
+        elif self.dataset ==  'SCENARIO_A':
+            if isTrain:
+                points, labels = load_points_from_file(f"/cs/labs/daphna/itai.david/py_repos/points_A.txt")
+            else:
+                points, labels = load_points_from_file(
+                    f"/cs/labs/daphna/itai.david/py_repos/TEST_points_A.txt")
+            # X_tensor = torch.from_numpy(points)  # features typically float32
+            # y_tensor = torch.from_numpy(labels)
+            dataset = SCENARIO_A(points, labels)
+            return dataset, len(dataset)
+        elif self.dataset ==  'HALF_MOON':
+            if isTrain:
+                points, labels = load_points_from_file(f"/cs/labs/daphna/itai.david/py_repos/points_HALF_MOON_2.txt")
+            else:
+                points, labels = load_points_from_file(
+                    f"/cs/labs/daphna/itai.david/py_repos/TEST_points_HALF_MOON_2.txt")
+            # X_tensor = torch.from_numpy(points)  # features typically float32
+            # y_tensor = torch.from_numpy(labels)
+            dataset = HALF_MOON(points, labels)
+            return dataset, len(dataset)
 
         else:
             print("Either the specified {} dataset is not added or there is no if condition in getDataset function of Data class".format(self.dataset))
@@ -442,7 +466,7 @@ class Data:
 
         assert isinstance(indexes, np.ndarray), "Indexes has dtype: {} whereas expected is nd.array.".format(type(indexes))
         assert isinstance(batch_size, int), "Batchsize is expected to be of int type whereas currently it has dtype: {}".format(type(batch_size))
-        while len(indexes) < batch_size:
+        while len(indexes) < batch_size and len(indexes) > 0:
             orig_indexes = indexes
             indexes = np.concatenate((indexes, orig_indexes))
 
@@ -452,6 +476,8 @@ class Data:
         #     loader = DataLoader(dataset=data, batch_size=batch_size,sampler=subsetSampler, pin_memory=True)
         # else:
         batch_size = min(batch_size, len(indexes))
+        if batch_size == 0:
+            return None
 
         loader = MultiEpochsDataLoader(dataset=data, num_workers=8, batch_size=batch_size,
                                        sampler=subsetSampler, pin_memory=True, drop_last=True)
@@ -618,3 +644,14 @@ class Data:
         
         class_weights = torch.Tensor(class_weights)
         return class_weights
+
+
+def load_points_from_file(filename):
+    with open(filename, 'r') as f:
+        points = []
+        true_labels = []
+        for line in f:
+            x, y, true_label = line.strip().split()
+            points.append([float(x), float(y)])
+            true_labels.append(int(true_label))
+    return np.array(points).astype(np.float32), np.array(true_labels).astype(np.long)
