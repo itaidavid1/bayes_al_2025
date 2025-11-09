@@ -153,16 +153,15 @@ class BAYES_MISP:
                 old_margin = vals[:, 0] - vals[:, 1]
 
                 point_total_contribution = batched_diffs(self.K, old_margin, self.alpha, self.num_of_classes, diff_method="margin")
-            elif self.diff_method == 'max':
+            elif self.diff_method == 'max':  ### old proxy with alphas vector without prior
                 max_vals, indices = torch.max(norm_C, dim=1)
                 point_total_contribution = batched_diffs(self.K, max_vals, self.alpha, self.num_of_classes, diff_method="max")
 
             elif self.diff_method == 'top2_weighted_max':
 
-                #         point_total_contribution = batched_diffs_weighted(self.K, self.C, self.alpha, self.num_of_classes, diff_method="weighted_max")
                 vals, inds = torch.topk(self.C, k=2, dim=1)
                 point_total_contribution = batched_diffs_weighted(self.K, self.C, vals, inds, diff_method="weighted_max", cont_method=self.cont_method)
-            elif self.diff_method == 'full_weighted_max':
+            elif self.diff_method == 'full_weighted_max': ### the method with the excepectation
                 if len(self.K.shape)==2:
                     self.K.unsqueeze_(2)
                 point_total_contribution = batched_diffs_efficient_weighted(self.K, self.C,
@@ -237,16 +236,16 @@ def batched_diffs_efficient_weighted(K: torch.Tensor, C: torch.Tensor, chunk_siz
             new_state_vec.div_(future_sum)
             new_state_vec.sub_(old_max)
 
-            if cont_method == "positive":
+            if cont_method == "positive": ### regular method
                 new_state_vec.clamp_(min=0)
-            elif cont_method == 'abs':
+            elif cont_method == 'abs': ### take all contribution
                  torch.abs(new_state_vec, out=new_state_vec)
             elif cont_method == "fusion":
                  class_corr_batched = class_corr[i:end]
                  is_neg = new_state_vec < 0
                  new_state_vec[is_neg & ~class_corr_batched] = 0
                  new_state_vec[is_neg & class_corr_batched] *= -1
-            elif cont_method == "reg_sum_postive":
+            elif cont_method == "reg_sum_postive": ## take average contribution (not weighted by the prior)
                  new_state_vec.clamp_(min=0)
                  result[i:end] = torch.sum(new_state_vec, dim=(1, 2))
 
