@@ -17,7 +17,7 @@ def compute_norm(x1, x2, device, batch_size=512):
     for i in range(batch_round):
         # distance comparisons are done in batches to reduce memory consumption
         x2_subset = x2[:, i * batch_size: (i + 1) * batch_size]
-        dist = torch.cdist(x1, x2_subset, p=2.0) #.to(dtype=torch.float16)
+        dist = torch.cdist(x1, x2_subset, p=2.0).to(dtype=torch.float16)
 
         dist_matrix.append(dist.cpu())
         del dist
@@ -60,7 +60,8 @@ class BAYES_MISP:
         self.ds_name = self.cfg['DATASET']['NAME']
         self.seed = self.cfg['RNG_SEED']
         self.all_features = ds_utils.load_features(self.ds_name, train=True)
-        self.alpha = self.cfg.ALPHA
+        self.diff_method = self.cfg.DIFF_METHOD if 'DIFF_METHOD' in self.cfg else 'abs_diff'
+        self.alpha = self.cfg.ALPHA if self.diff_method not in ['prob_cover', 'max_herding'] else 0
         self.debug = self.cfg.DEBUG
         self.norm_importance = self.cfg.NORM_IMPORTANCE
         self.confidence_method = self.cfg.CONFIDENCE_METHOD if 'CONFIDENCE_METHOD' in self.cfg else 'max'
@@ -69,7 +70,7 @@ class BAYES_MISP:
         self.budgetSize = budgetSize
         self.delta = delta
         self.soft_border_val = self.cfg.SOFT_BORDER_VAL if 'SOFT_BORDER_VAL' in self.cfg else 0.15
-        self.diff_method = self.cfg.DIFF_METHOD if 'DIFF_METHOD' in self.cfg else 'abs_diff'
+
         kernel_type = self.cfg.KERNEL_TYPE if 'KERNEL_TYPE' in self.cfg else 'rbf'
         if kernel_type == 'tophat':
             self.kernel_fn = TopHatKernel('cuda')
@@ -135,10 +136,10 @@ class BAYES_MISP:
         # uset = uset[~invalid_mask]
         print(f'Start selecting {self.budgetSize} samples.')
         selected = []
-        if self.decrease_alpha and len(lset) > 0:
-            self.C -= self.alpha
-            self.alpha /= 2
-            self.C += self.alpha
+        # if self.decrease_alpha and len(lset) > 0:
+        #     self.C -= self.alpha
+        #     self.alpha /= 2
+        #     self.C += self.alpha
         for i in range(self.budgetSize):
             curr_l_set = np.concatenate((np.arange(len(self.lSet)), selected)).astype(int)
             # curr_l_set = np.concatenate((self.lSet, selected)).astype(int)
@@ -156,7 +157,10 @@ class BAYES_MISP:
             elif self.diff_method == 'max':  ### old proxy with alphas vector without prior
                 max_vals, indices = torch.max(norm_C, dim=1)
                 point_total_contribution = batched_diffs(self.K, max_vals, self.alpha, self.num_of_classes, diff_method="max")
-
+            elif self.diff_method in ['prob_cover', 'max_herding']:
+                max_vals, indices = torch.max(self.C, dim=1)
+                point_total_contribution = batched_diffs(self.K, max_vals, 0, self.num_of_classes,
+                                                         diff_method="abs_diff")
             elif self.diff_method == 'top2_weighted_max':
 
                 vals, inds = torch.topk(self.C, k=2, dim=1)
@@ -164,7 +168,15 @@ class BAYES_MISP:
             elif self.diff_method == 'full_weighted_max': ### the method with the excepectation
                 if len(self.K.shape)==2:
                     self.K.unsqueeze_(2)
-                point_total_contribution = batched_diffs_efficient_weighted(self.K, self.C,
+                use_thersh = False
+                if use_thersh:
+
+                    point_total_contribution = batched_diffs_efficient_weighted_with_threshold(self.K, self.C,
+                                                                                threshold = 0.1,
+                                                                                cont_method=self.cont_method,
+                                                                                class_corr=points_intres_class)
+                else:
+                    point_total_contribution = batched_diffs_efficient_weighted(self.K, self.C,
                                                           diff_method="efficient_full_weighted_max",cont_method=self.cont_method, class_corr=points_intres_class)
             else:
                 point_total_contribution = batched_diffs(self.K, self.C, diff_method=self.diff_method)
@@ -175,7 +187,10 @@ class BAYES_MISP:
 
             self.chosen_labels_num[chosen_label] += 1
 
-            self.C[:, chosen_label] += self.K[sampled_point].squeeze().to('cuda')
+            if self.diff_method in ['prob_cover', 'max_herding']:
+                self.C[:, chosen_label] = torch.maximum(self.C[:, chosen_label], self.K[sampled_point].to('cuda').squeeze())
+            else:
+                self.C[:, chosen_label] += self.K[sampled_point].squeeze().to('cuda')
             # self.C[:, chosen_label] = torch.maximum(self.C[:, chosen_label], self.K[sampled_point].squeeze())
             self.cum_labels_info[chosen_label] += torch.sum(self.K[sampled_point].to('cuda'))
 
@@ -264,7 +279,8 @@ def batched_diffs_efficient_weighted(K: torch.Tensor, C: torch.Tensor, chunk_siz
 
                  continue
 
-            result[i:end] = torch.bmm(new_state_vec, weights_batched.unsqueeze_(2)).sum(dim=1).squeeze(1)
+            # result[i:end] = torch.bmm(new_state_vec, weights_batched.unsqueeze_(2)).sum(dim=1).squeeze(1)
+            result[i:end] = torch.einsum('ijk,ik->i', new_state_vec, weights_batched)
             del new_state_vec
             del K_batched
             del weights_batched
@@ -272,6 +288,122 @@ def batched_diffs_efficient_weighted(K: torch.Tensor, C: torch.Tensor, chunk_siz
             # res = new_state_vec * weights_batched
 
     return result
+
+def batched_diffs_efficient_weighted_with_threshold(K: torch.Tensor, C: torch.Tensor, chunk_size: int = 1024, threshold:float = 0.001, cont_method: str = "positive", class_corr=None):
+    """
+    Optimized version using sparse matrices for thresholded weights.
+    All calculations leverage sparse matrix operations for efficiency.
+    
+    K: (D, N, 1) kernel matrix where D=N
+    C: (D, num_classes) confidence matrix
+    """
+    D, N, _ = K.shape
+    result = torch.empty((D, )).to(device=C.device)
+    max_C, _ = torch.max(C, dim=1, keepdim=True)  # (D, 1)
+    sum_C = torch.sum(C, dim=1, keepdim=True)     # (D, 1)
+    norm_C = (C / sum_C)                          # (D, num_classes)
+    
+    # Apply threshold and convert to sparse (this is the key optimization)
+    norm_C[norm_C < threshold] = 0
+    norm_C_sparse = norm_C.to_sparse_csr()  # Use CSR format for efficient row access
+
+    old_max = (max_C / sum_C)          # (D, 1)
+    C_diff = (C - max_C).unsqueeze(0)  # (1, D, num_classes)
+    num_iterations = int(N)
+    
+    if class_corr is not None:
+        class_corr = class_corr.unsqueeze(1).to(torch.bool)  # (D, 1, num_classes)
+
+    K_dense = K.squeeze(-1).to(device=C.device)           # (D, N)
+    K_dense[K_dense < threshold] = 0
+    K_sparse = K_dense.to_sparse_csr()
+    
+    for i in range(num_iterations):
+            # Get the i-th row of K (kernel similarities for point i)
+            weights_sparse = norm_C_sparse[i]
+
+            if weights_sparse._nnz() == 0:
+                result[i] = 0
+                continue
+
+            weights_coo = weights_sparse.to_sparse_coo()
+            nonzero_indices = weights_coo.indices().squeeze(0)
+            nonzero_weights = weights_coo.values()
+            
+            K_row_sparse = K_sparse[i]
+            if K_row_sparse._nnz() == 0:
+                result[i] = 0
+                continue
+
+            active_points = K_row_sparse.indices().squeeze(0)
+            K_values = K_row_sparse.values().unsqueeze(1)  # (num_active, 1)
+
+            sum_C_active = sum_C[active_points]
+            max_C_active = max_C[active_points]
+            old_max_active = old_max[active_points]
+
+            future_sum = sum_C_active.unsqueeze(0) + K_values.unsqueeze(0)
+            state_add = max_C_active.unsqueeze(0) + K_values.unsqueeze(0)
+            old_max_batched = old_max_active.unsqueeze(0)
+
+            C_diff_relevant = C_diff[:, active_points][:, :, nonzero_indices]  # (1, num_active, num_nonzero)
+
+            new_state_vec = torch.maximum(-K_values.unsqueeze(0), C_diff_relevant)
+            new_state_vec.add_(state_add)
+            new_state_vec.div_(future_sum)
+            new_state_vec.sub_(old_max_batched)
+
+            # Apply contribution method
+            if cont_method == "positive": ### regular method
+                new_state_vec.clamp_(min=0)
+            elif cont_method == 'abs': ### take all contribution
+                 torch.abs(new_state_vec, out=new_state_vec)
+            elif cont_method == "fusion":
+                 if class_corr is not None:
+                     class_corr_batched = class_corr[i, :, nonzero_indices].unsqueeze(1)
+                     is_neg = new_state_vec < 0
+                     new_state_vec[is_neg & ~class_corr_batched] = 0
+                     new_state_vec[is_neg & class_corr_batched] *= -1
+            elif cont_method == "reg_sum_postive": ## take average contribution (not weighted by the prior)
+                 new_state_vec.clamp_(min=0)
+                 result[i] = torch.sum(new_state_vec)
+
+                 del new_state_vec
+                 del K_values
+                 del active_points
+                 del sum_C_active
+                 del max_C_active
+                 del old_max_active
+
+                 continue
+            elif cont_method == "reg_sum_abs":
+                 torch.abs(new_state_vec, out=new_state_vec)
+                 result[i] = torch.sum(new_state_vec)
+
+                 del new_state_vec
+                 del K_values
+                 del active_points
+                 del sum_C_active
+                 del max_C_active
+                 del old_max_active
+
+                 continue
+
+            # Compute weighted contribution using sparse operations
+            # new_state_vec: (1, D, num_nonzero_classes), nonzero_weights: (num_nonzero_classes,)
+            # Only sum over non-zero weight classes for maximum efficiency
+            new_state_vec_squeezed = new_state_vec.squeeze(0)  # (D, num_nonzero_classes)
+            
+            # Efficient sparse dot product: only multiply with non-zero weights
+            result[i] = torch.einsum('jk,k->', new_state_vec_squeezed, nonzero_weights)
+            
+            del new_state_vec
+            del new_state_vec_squeezed
+            del nonzero_indices
+            del nonzero_weights
+
+    return result
+
 
 def batched_diffs_efficient_weighted_v2(K: torch.Tensor, C: torch.Tensor, chunk_size: int = 256, diff_method: str = "abs_diff", cont_method: int = 0):
     D, N, _ = K.shape
@@ -315,7 +447,9 @@ def batched_diffs(K, C, alpha, number_of_classes, chunk_size=1024, diff_method="
     for start in range(0, N, chunk_size):
         end = min(start + chunk_size, N)
         if diff_method == "abs_diff":
-            result[start:end] = torch.sum(torch.maximum(K[start:end] - C, torch.zeros_like(K[start:end]).to(device=C.device)), dim=1)
+            K_batched = K[start:end]
+            K_batched = K_batched.to('cuda')
+            result[start:end] = torch.sum(torch.maximum(K_batched - C, torch.zeros_like(K_batched).to(device=C.device)), dim=1)
         elif diff_method == "max":
             K_batched = K[start:end]
             K_batched = K_batched.to('cuda')
