@@ -2,6 +2,8 @@ import numpy as np
 import pandas as pd
 import torch
 import gc
+import pickle
+import scipy.sparse as sp
 import pycls.datasets.utils as ds_utils
 from tools.utils import visualize_tsne
 import time
@@ -10,14 +12,14 @@ import matplotlib.pyplot as plt
 ###MISP = maximum importance sampling points
 torch.cuda.empty_cache()
 
-def compute_norm(x1, x2, device, batch_size=512):
+def compute_norm(x1, x2, device, batch_size=512, matrices_type=torch.float16):
     x1, x2 = x1.unsqueeze(0).to(device), x2.unsqueeze(0).to(device) # 1 x n x d, 1 x n' x d
     dist_matrix = []
     batch_round = x2.shape[1] // batch_size + int(x2.shape[1] % batch_size > 0)
     for i in range(batch_round):
         # distance comparisons are done in batches to reduce memory consumption
         x2_subset = x2[:, i * batch_size: (i + 1) * batch_size]
-        dist = torch.cdist(x1, x2_subset, p=2.0).to(dtype=torch.float16)
+        dist = torch.cdist(x1, x2_subset).to(dtype=matrices_type)
 
         dist_matrix.append(dist.cpu())
         del dist
@@ -29,8 +31,8 @@ class RBFKernel(object):
     def __init__(self, device):
         self.device = device
 
-    def compute_kernel(self, x1, x2, h=1.0, batch_size=512):
-        norm = compute_norm(x1, x2, self.device, batch_size=batch_size)
+    def compute_kernel(self, x1, x2, h=1.0, batch_size=512, matrices_type=torch.float16):
+        norm = compute_norm(x1, x2, self.device, batch_size=batch_size, matrices_type=matrices_type)
         k = torch.exp(-1.0 * (norm / h) ** 2)
         return k
 
@@ -38,7 +40,7 @@ class TopHatKernel(object):
     def __init__(self, device):
         self.device = device
 
-    def compute_kernel(self, x1, x2, h, batch_size=512):
+    def compute_kernel(self, x1, x2, h, batch_size=512, matrices_type=torch.float16):
         x1, x2 = x1.unsqueeze(0).to(self.device), x2.unsqueeze(0).to(self.device) # 1 x n x d, 1 x n' x d
         dist_matrix = []
         batch_round = x2.shape[1] // batch_size + int(x2.shape[1] % batch_size > 0)
@@ -46,7 +48,7 @@ class TopHatKernel(object):
             # distance comparisons are done in batches to reduce memory consumption
             x2_subset = x2[:, i * batch_size: (i + 1) * batch_size]
             dist = torch.cdist(x1, x2_subset)
-            dist = (dist < h).to(dtype=torch.float16)
+            dist = (dist < h).to(dtype=matrices_type)
             dist_matrix.append(dist.cpu())
             del dist
         dist_matrix = torch.cat(dist_matrix, dim=-1).squeeze(0)
@@ -63,11 +65,13 @@ class BAYES_MISP:
         self.diff_method = self.cfg.DIFF_METHOD if 'DIFF_METHOD' in self.cfg else 'abs_diff'
         self.alpha = self.cfg.ALPHA if self.diff_method not in ['prob_cover', 'max_herding'] else 0
         self.debug = self.cfg.DEBUG
-        self.norm_importance = self.cfg.NORM_IMPORTANCE
+        self.use_sparse = self.cfg.SPARSE_K
+        self.matrices_type = torch.float32 if self.use_sparse else torch.float16
         self.confidence_method = self.cfg.CONFIDENCE_METHOD if 'CONFIDENCE_METHOD' in self.cfg else 'max'
         self.cont_method = self.cfg.CONT_METHOD if 'CONT_METHOD' in self.cfg else 'positive'
         self.decrease_alpha = self.cfg.DECREASING_ALPHA if 'DECREASING_ALPHA' in self.cfg else False
         self.budgetSize = budgetSize
+        self.K_sparsity_threshold = self.cfg.K_SPARSITY_THRESHOLD
         self.delta = delta
         self.soft_border_val = self.cfg.SOFT_BORDER_VAL if 'SOFT_BORDER_VAL' in self.cfg else 0.15
 
@@ -79,10 +83,22 @@ class BAYES_MISP:
 
         self.train_labels_general = np.array(train_labels)
         unique_labels = np.unique(self.train_labels_general)
-        self.C_general = torch.full((self.all_features.shape[0], unique_labels.size), self.alpha, device='cuda', dtype=torch.float16)
+        self.C_general = torch.full((self.all_features.shape[0], unique_labels.size), self.alpha, device='cuda', dtype=self.matrices_type)
         self.num_of_classes = np.unique(self.train_labels_general).size
         self.chosen_labels_num = torch.zeros(self.num_of_classes).to('cuda')
         self.cum_labels_info = torch.zeros(self.num_of_classes).to('cuda')
+        self.labeled_points_mask_general = torch.zeros(self.all_features.shape[0], dtype=torch.bool).to('cuda')
+        all_features_tensor = torch.from_numpy(self.all_features)
+        self.K_general = self.kernel_fn.compute_kernel(
+                all_features_tensor, all_features_tensor, self.delta, matrices_type=self.matrices_type)
+        del all_features_tensor
+
+        if self.use_sparse:
+            self.K_general[self.K_general < self.K_sparsity_threshold] = 0.0
+            K_coo = sp.coo_matrix(self.K_general)
+            self.K_general = K_coo.tocsr() # notice that K is now scipy csr sparse matrix
+            del K_coo
+
         if lset is not None and lset.size > 0:
             temp_K = self.kernel_fn.compute_kernel(
                 torch.from_numpy(self.all_features), torch.from_numpy(self.all_features), self.delta).to('cuda')
@@ -99,10 +115,45 @@ class BAYES_MISP:
         torch.cuda.empty_cache()
         self.set_rel_features(lset, uset)
         self.activeSet = []
-        self.K = self.kernel_fn.compute_kernel(
-            self.rel_features, self.rel_features, self.delta)
+        # if self.use_sparse:
+        #     with open("/cs/labs/daphna/itai.david/py_repos/cifar10_data/cifar10_tophat_K_sparse_csr.pkl", "rb") as f:
+        #         K_csr = pickle.load(f)
+        #     K_csr_shuffled = K_csr[self.relevant_indices, :][:, self.relevant_indices]
+        #     crow_indices = torch.from_numpy(K_csr_shuffled.indptr).to(torch.int64)
+        #     col_indices = torch.from_numpy(K_csr_shuffled.indices).to(torch.int64)
+        #     values = torch.from_numpy(K_csr_shuffled.data).to(torch.float32)
+        #
+        #     self.K = torch.sparse_csr_tensor(
+        #         crow_indices=crow_indices,
+        #         col_indices=col_indices,
+        #         values=values,
+        #         size=K_csr_shuffled.shape,
+        #         dtype=values.dtype
+        #     )
+        # else:
+        #     self.K = self.kernel_fn.compute_kernel(
+        #         self.rel_features, self.rel_features, self.delta)
+
+        if self.use_sparse:
+            # now using scipy csr sparse matrix and convert it to torch csr sparse matrix
+            K_csr_shuffled = self.K_general[self.relevant_indices, :][:, self.relevant_indices]
+            crow_indices = torch.from_numpy(K_csr_shuffled.indptr).to(torch.int64)
+            col_indices = torch.from_numpy(K_csr_shuffled.indices).to(torch.int64)
+            values = torch.from_numpy(K_csr_shuffled.data).to(torch.float32)
+
+            self.K = torch.sparse_csr_tensor(
+                crow_indices=crow_indices,
+                col_indices=col_indices,
+                values=values,
+                size=K_csr_shuffled.shape,
+                dtype=values.dtype
+            )
+            del K_csr_shuffled, values, col_indices, crow_indices
+        else:
+            self.K =  self.K_general[self.relevant_indices, :][:, self.relevant_indices]
         self.C = self.C_general[self.relevant_indices].to('cuda')
         self.train_labels = self.train_labels_general[self.relevant_indices]
+        self.labeled_points_mask = self.labeled_points_mask_general[self.relevant_indices]
 
     def set_rel_features(self, lset, uset):
         self.lSet = lset
@@ -166,16 +217,11 @@ class BAYES_MISP:
                 vals, inds = torch.topk(self.C, k=2, dim=1)
                 point_total_contribution = batched_diffs_weighted(self.K, self.C, vals, inds, diff_method="weighted_max", cont_method=self.cont_method)
             elif self.diff_method == 'full_weighted_max': ### the method with the excepectation
-                if len(self.K.shape)==2:
-                    self.K.unsqueeze_(2)
-                use_thersh = False
-                if use_thersh:
-
-                    point_total_contribution = batched_diffs_efficient_weighted_with_threshold(self.K, self.C,
-                                                                                threshold = 0.1,
-                                                                                cont_method=self.cont_method,
-                                                                                class_corr=points_intres_class)
+                if self.use_sparse:
+                    point_total_contribution = batched_diffs_efficient_weighted_sparse(self.K, self.C, cont_method=self.cont_method)
                 else:
+                    if len(self.K.shape) == 2:
+                        self.K.unsqueeze_(2)
                     point_total_contribution = batched_diffs_efficient_weighted(self.K, self.C,
                                                           diff_method="efficient_full_weighted_max",cont_method=self.cont_method, class_corr=points_intres_class)
             else:
@@ -187,17 +233,24 @@ class BAYES_MISP:
 
             self.chosen_labels_num[chosen_label] += 1
 
+            K_row_dense = self.K[sampled_point].to_dense().to('cuda').squeeze()
+
+
             if self.diff_method in ['prob_cover', 'max_herding']:
-                self.C[:, chosen_label] = torch.maximum(self.C[:, chosen_label], self.K[sampled_point].to('cuda').squeeze())
+                self.C[:, chosen_label] = torch.maximum(self.C[:, chosen_label],K_row_dense)
             else:
-                self.C[:, chosen_label] += self.K[sampled_point].squeeze().to('cuda')
+                self.labeled_points_mask[sampled_point] = True
+                self.C[sampled_point, :] = torch.zeros(self.num_of_classes).to('cuda')
+                self.C[sampled_point, chosen_label] = 1.0
+
+                self.C[~self.labeled_points_mask, chosen_label] += K_row_dense[~self.labeled_points_mask]
+
             # self.C[:, chosen_label] = torch.maximum(self.C[:, chosen_label], self.K[sampled_point].squeeze())
-            self.cum_labels_info[chosen_label] += torch.sum(self.K[sampled_point].to('cuda'))
+            self.cum_labels_info[chosen_label] += K_row_dense.sum()
 
             assert sampled_point not in selected, 'sample was already selected'
             selected.append(sampled_point)
-
-
+            del K_row_dense
 
         if False:
             name = "prob_method_v1"
@@ -207,6 +260,7 @@ class BAYES_MISP:
         activeSet = self.relevant_indices[selected]
 
         self.C_general[self.relevant_indices] = self.C
+        self.labeled_points_mask_general[self.relevant_indices] = self.labeled_points_mask
         remainSet = np.array(sorted(list(set(self.uSet) - set(activeSet))))
         self.activeSet = activeSet
         print(f'Finished the selection of {len(activeSet)} samples.')
@@ -236,171 +290,165 @@ def batched_diffs_efficient_weighted(K: torch.Tensor, C: torch.Tensor, chunk_siz
     max_C.unsqueeze_(0)
     class_corr = class_corr.unsqueeze(1).to(torch.bool)
     for i in range(0, num_iterations, int(chunk_size)):
-            end = min(i + chunk_size, D)
-            K_batched = K[i:end]
-            K_batched = K_batched.to('cuda')
-            weights_batched = norm_C[i:end]
+        end = min(i + chunk_size, D)
+        K_batched = K[i:end]
+        K_batched = K_batched.to('cuda')
+        weights_batched = norm_C[i:end]
 
 
-            future_sum = K_batched + sum_C
-            state_add = max_C + K_batched
+        future_sum = K_batched + sum_C
+        state_add = max_C + K_batched
 
-            new_state_vec = torch.maximum(-K_batched, C_diff)
+        new_state_vec = torch.maximum(-K_batched, C_diff)
 
-            new_state_vec.add_(state_add)
-            new_state_vec.div_(future_sum)
-            new_state_vec.sub_(old_max)
+        new_state_vec.add_(state_add)
+        new_state_vec.div_(future_sum)
+        new_state_vec.sub_(old_max)
 
-            if cont_method == "positive": ### regular method
-                new_state_vec.clamp_(min=0)
-            elif cont_method == 'abs': ### take all contribution
-                 torch.abs(new_state_vec, out=new_state_vec)
-            elif cont_method == "fusion":
-                 class_corr_batched = class_corr[i:end]
-                 is_neg = new_state_vec < 0
-                 new_state_vec[is_neg & ~class_corr_batched] = 0
-                 new_state_vec[is_neg & class_corr_batched] *= -1
-            elif cont_method == "reg_sum_postive": ## take average contribution (not weighted by the prior)
-                 new_state_vec.clamp_(min=0)
-                 result[i:end] = torch.sum(new_state_vec, dim=(1, 2))
+        if cont_method == "positive": ### regular method
+            new_state_vec.clamp_(min=0)
+        elif cont_method == 'abs': ### take all contribution
+            torch.abs(new_state_vec, out=new_state_vec)
+        elif cont_method == "fusion":
+            class_corr_batched = class_corr[i:end]
+            is_neg = new_state_vec < 0
+            new_state_vec[is_neg & ~class_corr_batched] = 0
+            new_state_vec[is_neg & class_corr_batched] *= -1
+        elif cont_method == "reg_sum_postive": ## take average contribution (not weighted by the prior)
+            new_state_vec.clamp_(min=0)
+            result[i:end] = torch.sum(new_state_vec, dim=(1, 2))
 
-                 del new_state_vec
-                 del K_batched
-                 del weights_batched
-
-                 continue
-            elif cont_method == "reg_sum_abs":
-                 torch.abs(new_state_vec, out=new_state_vec)
-                 result[i:end] = torch.sum(new_state_vec, dim=(1, 2))
-
-                 del new_state_vec
-                 del K_batched
-                 del weights_batched
-
-                 continue
-
-            # result[i:end] = torch.bmm(new_state_vec, weights_batched.unsqueeze_(2)).sum(dim=1).squeeze(1)
-            result[i:end] = torch.einsum('ijk,ik->i', new_state_vec, weights_batched)
             del new_state_vec
             del K_batched
             del weights_batched
-            # result[i:end] = torch.einsum('ijk,ik->i',new_state_vec, weights_batched)
-            # res = new_state_vec * weights_batched
 
+            continue
+        elif cont_method == "reg_sum_abs":
+            torch.abs(new_state_vec, out=new_state_vec)
+            result[i:end] = torch.sum(new_state_vec, dim=(1, 2))
+
+            del new_state_vec
+            del K_batched
+            del weights_batched
+
+            continue
+
+        # result[i:end] = torch.bmm(new_state_vec, weights_batched.unsqueeze_(2)).sum(dim=1).squeeze(1)
+        result[i:end] = torch.einsum('ijk,ik->i', new_state_vec, weights_batched)
+        del new_state_vec
+        del K_batched
+        del weights_batched
+        # result[i:end] = torch.einsum('ijk,ik->i',new_state_vec, weights_batched)
+        # res = new_state_vec * weights_batched
     return result
 
-def batched_diffs_efficient_weighted_with_threshold(K: torch.Tensor, C: torch.Tensor, chunk_size: int = 1024, threshold:float = 0.001, cont_method: str = "positive", class_corr=None):
-    """
-    Optimized version using sparse matrices for thresholded weights.
-    All calculations leverage sparse matrix operations for efficiency.
-    
-    K: (D, N, 1) kernel matrix where D=N
-    C: (D, num_classes) confidence matrix
-    """
-    D, N, _ = K.shape
+
+# @torch.compile(backend="inductor")
+def batched_diffs_efficient_weighted_sparse(K_csr: torch.Tensor, C: torch.Tensor, chunk_size: int = 1024, cont_method: str = "positive"):
+    D, N = K_csr.shape
+    dev = C.device
+    crow = K_csr.crow_indices().to(dev)  # shape (D+1,)
+    ccol = K_csr.col_indices().to(dev)  # shape (nnz,)
+    cvals = K_csr.values().to(dev)  # shape (nnz,)
+    D = crow.numel() - 1
+    classes = C.shape[1]
+    uniform_default_val = 1.0 / classes
+
+
+
     result = torch.empty((D, )).to(device=C.device)
-    max_C, _ = torch.max(C, dim=1, keepdim=True)  # (D, 1)
-    sum_C = torch.sum(C, dim=1, keepdim=True)     # (D, 1)
-    norm_C = (C / sum_C)                          # (D, num_classes)
-    
-    # Apply threshold and convert to sparse (this is the key optimization)
-    norm_C[norm_C < threshold] = 0
-    norm_C_sparse = norm_C.to_sparse_csr()  # Use CSR format for efficient row access
+    max_C, _ = torch.max(C, dim=1, keepdim=True)
+    sum_C = torch.sum(C, dim=1, keepdim=True)
+    has_mass = (sum_C != 0)
+    safe_sum = torch.where(has_mass, sum_C, torch.ones_like(sum_C))
+    norm_C = torch.where(has_mass, C / safe_sum, torch.full_like(C, uniform_default_val))
+    old_max = torch.where(has_mass, max_C / safe_sum, torch.zeros_like(max_C))
 
-    old_max = (max_C / sum_C)          # (D, 1)
-    C_diff = (C - max_C).unsqueeze(0)  # (1, D, num_classes)
+    # norm_C = (C / sum_C)
+    # old_max = (max_C / sum_C)
+
+    C_diff = (C - max_C)
+    max_C = max_C.squeeze()
+    sum_C = sum_C.squeeze()
+    C_diff = C_diff.squeeze()
+    old_max = old_max.squeeze()
     num_iterations = int(N)
-    
-    if class_corr is not None:
-        class_corr = class_corr.unsqueeze(1).to(torch.bool)  # (D, 1, num_classes)
+    for row_start in range(0, D, chunk_size):
+        row_end = min(row_start + chunk_size, D)
+        b = row_end - row_start
 
-    K_dense = K.squeeze(-1).to(device=C.device)           # (D, N)
-    K_dense[K_dense < threshold] = 0
-    K_sparse = K_dense.to_sparse_csr()
-    
-    for i in range(num_iterations):
-            # Get the i-th row of K (kernel similarities for point i)
-            weights_sparse = norm_C_sparse[i]
+        # CSR pointers for the chunk
+        starts = crow[row_start:row_end]  # shape (b,)
+        ends = crow[row_start + 1: row_end + 1]  # shape (b,)
+        lengths = (ends - starts).to(torch.long)  # (b,)
 
-            if weights_sparse._nnz() == 0:
-                result[i] = 0
-                continue
+        total_nnz = int(lengths.sum().item())
 
-            weights_coo = weights_sparse.to_sparse_coo()
-            nonzero_indices = weights_coo.indices().squeeze(0)
-            nonzero_weights = weights_coo.values()
-            
-            K_row_sparse = K_sparse[i]
-            if K_row_sparse._nnz() == 0:
-                result[i] = 0
-                continue
+        if total_nnz == 0:
+            # nothing in this chunk, skip
+            continue
 
-            active_points = K_row_sparse.indices().squeeze(0)
-            K_values = K_row_sparse.values().unsqueeze(1)  # (num_active, 1)
+            # global slice of indices/values for this chunk
+        slice_start = int(starts[0].item())
+        slice_end = int(ends[-1].item())
 
-            sum_C_active = sum_C[active_points]
-            max_C_active = max_C[active_points]
-            old_max_active = old_max[active_points]
+        cols_all = ccol[slice_start:slice_end]  # (total_nnz,)
+        vals_all = cvals[slice_start:slice_end]  # (total_nnz,)
 
-            future_sum = sum_C_active.unsqueeze(0) + K_values.unsqueeze(0)
-            state_add = max_C_active.unsqueeze(0) + K_values.unsqueeze(0)
-            old_max_batched = old_max_active.unsqueeze(0)
+        # row index for each nnz entry within the chunk: 0..b-1 repeated by lengths
+        row_indices = torch.repeat_interleave(torch.arange(b, device=dev, dtype=torch.long),
+                                              lengths)  # (total_nnz,)
 
-            C_diff_relevant = C_diff[:, active_points][:, :, nonzero_indices]  # (1, num_active, num_nonzero)
+        # Map chunk row-local indices -> global row indices (if needed)
+        global_rows = torch.arange(row_start, row_end, device=dev, dtype=torch.long)  # (b,)
 
-            new_state_vec = torch.maximum(-K_values.unsqueeze(0), C_diff_relevant)
-            new_state_vec.add_(state_add)
-            new_state_vec.div_(future_sum)
-            new_state_vec.sub_(old_max_batched)
+        kvals = vals_all  # (total_nnz, 1)
+        sumC_cols = sum_C[cols_all]  # (total_nnz, 1)
+        maxC_cols = max_C[cols_all]  # (total_nnz, 1)
+        old_max_cols = old_max[cols_all]  # (total_nnz, 1)
+        Cdiff_cols = C_diff[cols_all]
 
-            # Apply contribution method
-            if cont_method == "positive": ### regular method
-                new_state_vec.clamp_(min=0)
-            elif cont_method == 'abs': ### take all contribution
-                 torch.abs(new_state_vec, out=new_state_vec)
-            elif cont_method == "fusion":
-                 if class_corr is not None:
-                     class_corr_batched = class_corr[i, :, nonzero_indices].unsqueeze(1)
-                     is_neg = new_state_vec < 0
-                     new_state_vec[is_neg & ~class_corr_batched] = 0
-                     new_state_vec[is_neg & class_corr_batched] *= -1
-            elif cont_method == "reg_sum_postive": ## take average contribution (not weighted by the prior)
-                 new_state_vec.clamp_(min=0)
-                 result[i] = torch.sum(new_state_vec)
+        negk = -kvals  # (total_nnz,1)
+        # maximum between negk and Cdiff_cols: broadcast negk on classes dimension
+        # torch.maximum requires same shape; expand negk to (total_nnz, classes)
+        negk_expand = negk.expand(classes, -1).T  # (total_nnz, classes)
+        new_state = torch.maximum(negk_expand, Cdiff_cols)  # (total_nnz, classes)
 
-                 del new_state_vec
-                 del K_values
-                 del active_points
-                 del sum_C_active
-                 del max_C_active
-                 del old_max_active
+        state_add = maxC_cols + kvals  # (total_nnz,1)
+        new_state = new_state + state_add.expand(classes, -1).T  # add per-row scalar across classes
 
-                 continue
-            elif cont_method == "reg_sum_abs":
-                 torch.abs(new_state_vec, out=new_state_vec)
-                 result[i] = torch.sum(new_state_vec)
+        future_sum = (kvals + sumC_cols)  # (total_nnz,1)
 
-                 del new_state_vec
-                 del K_values
-                 del active_points
-                 del sum_C_active
-                 del max_C_active
-                 del old_max_active
+        valid_denom = (future_sum != 0)
+        safe_future_sum = torch.where(valid_denom, future_sum, torch.ones_like(future_sum))
+        safe_denom_expanded = safe_future_sum.expand(classes, -1).T
+        mask_expanded = valid_denom.expand(classes, -1).T
+        # divide
+        new_state = new_state / safe_denom_expanded
+        new_state = torch.where(mask_expanded, new_state, torch.zeros_like(new_state))
+        # new_state = new_state / future_sum.expand(classes, -1).T
+        # subtract old_max (per column)
+        new_state = new_state - old_max_cols.expand(classes, -1).T
 
-                 continue
+        # Now apply continuation method
+        if cont_method == "positive":
+            new_state.clamp_(min=0.0)
 
-            # Compute weighted contribution using sparse operations
-            # new_state_vec: (1, D, num_nonzero_classes), nonzero_weights: (num_nonzero_classes,)
-            # Only sum over non-zero weight classes for maximum efficiency
-            new_state_vec_squeezed = new_state_vec.squeeze(0)  # (D, num_nonzero_classes)
-            
-            # Efficient sparse dot product: only multiply with non-zero weights
-            result[i] = torch.einsum('jk,k->', new_state_vec_squeezed, nonzero_weights)
-            
-            del new_state_vec
-            del new_state_vec_squeezed
-            del nonzero_indices
-            del nonzero_weights
+        weights_chunk = norm_C[global_rows]  # (b, classes)
+        # Now map per-nnz: weights_for_nnz = weights_chunk[row_indices]
+        weights_for_nnz = weights_chunk[row_indices]  # (total_nnz, classes)
+
+        # Multiply elementwise and sum over classes -> per-nnz scalar
+        per_nnz_weighted = (new_state * weights_for_nnz).sum(dim=1)  # (total_nnz,)
+
+        # Aggregate per row via scatter_add
+        chunk_result = torch.zeros((b,), device=dev, dtype=C.dtype)
+        chunk_result.scatter_add_(0, row_indices, per_nnz_weighted)
+
+
+
+        # result[i:end] = torch.bmm(new_state_vec, weights_batched.unsqueeze_(2)).sum(dim=1).squeeze(1)
+        result[row_start:row_end] = chunk_result
 
     return result
 
@@ -461,6 +509,26 @@ def batched_diffs(K, C, alpha, number_of_classes, chunk_size=1024, diff_method="
         else:
             raise ValueError(f"Unknown diff method: {diff_method}")
     return result
+
+def batched_diffs_sparse(K, C, alpha, number_of_classes, chunk_size=1024, diff_method="abs_diff"):
+    D, N = K.shape
+    result = torch.empty(D).to(device=C.device)
+    for start in range(0, N, chunk_size):
+        end = min(start + chunk_size, N)
+        if diff_method == "abs_diff":
+            K_batched = K[start:end]
+            K_batched = K_batched.to('cuda')
+            result[start:end] = torch.sum(torch.maximum(K_batched - C, torch.zeros_like(K_batched).to(device=C.device)), dim=1)
+        elif diff_method == "max":
+            K_batched = K[start:end]
+            K_batched = K_batched.to('cuda')
+            result[start:end] = torch.sum(
+                torch.maximum(((K_batched + alpha) / (torch.maximum( K_batched+ alpha * number_of_classes, torch.full_like(K_batched, 1e-8)))) - C, torch.zeros_like(K_batched).to(device=C.device)), dim=1)
+        elif diff_method == 'margin':
+            result[start:end] = torch.sum(
+                torch.maximum((K[start:end] / (K[start:end] + alpha * number_of_classes)) - C, torch.zeros_like(K[start:end]).to(device=C.device)), dim=1)
+        else:
+            raise ValueError(f"Unknown diff method: {diff_method}")
 # @torch.compile(backend="cudagraphs")
 def batched_diffs_weighted(K, C, vals, inds, chunk_size=1024, diff_method="abs_diff", cont_method="positive"):
     D, N = K.shape
@@ -498,4 +566,120 @@ def batched_diffs_weighted(K, C, vals, inds, chunk_size=1024, diff_method="abs_d
     return result
 
 
+
+def slice_csr_rows(csr_tensor, start_row, length):
+    """
+    Fast slicing for CSR tensors. Replaces .narrow(0, start, length).
+    """
+    end_row = start_row + length
+
+    crow_indices = csr_tensor.crow_indices()
+    col_indices = csr_tensor.col_indices()
+    values = csr_tensor.values()
+
+    # 1. Find the data range in the underlying 1D arrays
+    # Data starts where row 'start_row' begins
+    p_start = crow_indices[start_row]
+    # Data ends where row 'end_row' begins
+    p_end = crow_indices[end_row]
+
+    # 2. Slice the values and column indices
+    new_values = values[p_start:p_end]
+    new_col_indices = col_indices[p_start:p_end]
+
+    # 3. Slice and Shift Row Pointers
+    # Extract pointers for the specific rows we want
+    new_crow_indices = crow_indices[start_row: end_row + 1]
+    # Shift them so the first row starts at index 0
+    new_crow_indices = new_crow_indices - p_start
+
+    # 4. Create the new CSR tensor
+    return torch.sparse_csr_tensor(
+        new_crow_indices,
+        new_col_indices,
+        new_values,
+        size=(length, csr_tensor.size(1)),
+        dtype=csr_tensor.dtype,
+        device=csr_tensor.device
+    )
+
+
+def csr_weighted_sum_collapsed(csr_weights, dense_vec):
+    """
+    Computes row-wise weighted sums, collapsing the feature dimension.
+
+    Input:
+      csr_weights: (Batch, N) - Sparse weights
+      dense_vec:   (Batch, N, D) - Dense features
+
+    Output:
+      result:      (Batch,) - Scalar result per batch item
+    """
+    # 1. Components
+    crow_indices = csr_weights.crow_indices()
+    col_indices = csr_weights.col_indices()
+    values = csr_weights.values()  # (NNZ)
+
+    # 2. Decompress Row Indices
+    rows_per_value = torch.arange(csr_weights.size(0), device=csr_weights.device).repeat_interleave(
+        crow_indices.diff()
+    )
+
+    # 3. Gather Dense Values -> Shape (NNZ, 1024)
+    # We extract only the vectors that correspond to non-zero weights
+    gathered_dense = dense_vec[rows_per_value, col_indices]
+
+    # --- OPTIMIZATION: Sum features FIRST ---
+    # Instead of multiplying (NNZ, 1024) * (NNZ, 1), we sum the 1024 features now.
+    # This reduces the problem from Matrix math to Vector math.
+    # Shape: (NNZ, 1024) -> (NNZ,)
+    gathered_sum = gathered_dense.sum(dim=1)
+
+    # 4. Multiply Weights * Summed_Features
+    # Shape: (NNZ,) * (NNZ,) -> (NNZ,)
+    products = values * gathered_sum
+
+    # 5. Aggregate back to Batch rows
+    # Shape: (Batch,)
+    result = torch.zeros(csr_weights.size(0), device=csr_weights.device, dtype=csr_weights.dtype)
+    result.index_add_(0, rows_per_value, products)
+
+    return result
+
+
+def apply_shared_mask_to_batch(template_csr, batch_dense):
+    """
+    Applies the sparsity pattern of a 2D CSR matrix to a 3D Dense Batch.
+
+    Args:
+        template_csr: Sparse CSR (Rows, Cols) - Your 'norm_C'
+        batch_dense:  Dense (Batch, Rows, Cols) - Your 'other_matrix'
+
+    Returns:
+        Sparse Batched CSR Tensor (Batch, Rows, Cols)
+    """
+    # 1. Get coordinates
+    rows_per_value = torch.arange(template_csr.size(0), device=template_csr.device).repeat_interleave(
+        template_csr.crow_indices().diff()
+    )
+    col_indices = template_csr.col_indices()
+
+    # 2. Extract values (The heavy lifting)
+    # Shape: (Batch, NNZ)
+    gathered_vals = batch_dense[:, rows_per_value, col_indices]
+
+    # 3. Build Batched CSR
+    B = batch_dense.size(0)
+
+    # We expand the indices to match the batch size.
+    # Note: We use .contiguous() on indices only if PyTorch throws a stride error,
+    # but usually .expand() is sufficient for current versions.
+    return torch.sparse_csr_tensor(
+        template_csr.crow_indices().unsqueeze(0).expand(B, -1),
+        template_csr.col_indices().unsqueeze(0).expand(B, -1),
+        gathered_vals,
+        size=batch_dense.shape,
+        dtype=batch_dense.dtype,
+        device=batch_dense.device
+    )
 

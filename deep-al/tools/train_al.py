@@ -113,14 +113,20 @@ def argparser():
     parser.add_argument('--cont_method', default='positive', type=str)
     parser.add_argument('--k_logistic', default=50, type=int)
     parser.add_argument('--a_logistic', default=0.8, type=float)
+    parser.add_argument('--K_sparsity_threshold', default=1.0, type=float)
+    parser.add_argument('--pseudo_labels_threshold', default=1.0, type=float)
+    parser.add_argument('--train_pseudo_labels', action='store_true')
     parser.add_argument('--alpha', default=0.5, type=float)
-    parser.add_argument('--soft_border_val', default=0.5, type=float)
+    parser.add_argument('--sparse_K', action='store_true')
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('--high_budget', action='store_true')
     parser.add_argument('--norm_importance', action='store_true')
     parser.add_argument('--sparse_ds', action='store_true')
     parser.add_argument('--decrease_alpha', action='store_true')
     parser.add_argument('--max_iter', default=32, type=int)
+    parser.add_argument('--start_iter', default=0, type=int)
+    parser.add_argument('--eval_frequency', default=1, type=int)
+
     return parser
 
 
@@ -207,7 +213,10 @@ def main(cfg):
         test_data.features = test_data.features[test_spare_inds]
         test_data.targets = np.array(test_data.targets)[test_spare_inds].tolist()
         test_data.data = test_data.data[test_spare_inds.astype(int)]
-
+    if cfg.TRAIN_PSEUDO_LABELS:
+        pseudo_train_data, pseudo_train_size = data_obj.getDataset(save_dir=cfg.DATASET.ROOT_DIR, isTrain=True, isDownload=True)
+    else:
+        pseudo_train_data, pseudo_train_size = None, None
     cfg.ACTIVE_LEARNING.INIT_L_RATIO = args.initial_size / train_size
     print("\nDataset {} Loaded Sucessfully.\nTotal Train Size: {} and Total Test Size: {}\n".format(cfg.DATASET.NAME, train_size, test_size))
     logger.info("Dataset {} Loaded Sucessfully. Total Train Size: {} and Total Test Size: {}\n".format(cfg.DATASET.NAME, train_size, test_size))
@@ -254,7 +263,7 @@ def main(cfg):
     logger.info("Labeled Set: {}, Unlabeled Set: {}, Validation Set: {}\n".format(len(lSet), len(uSet), len(valSet)))
 
     # Preparing dataloaders for initial training
-    lSet_loader = data_obj.getIndexesDataLoader(indexes=lSet, batch_size=cfg.TRAIN.BATCH_SIZE, data=train_data)
+    lSet_loader = get_lset_loader(al_obj, cfg, data_obj, lSet, pseudo_train_data, train_data)
     valSet_loader = data_obj.getIndexesDataLoader(indexes=valSet, batch_size=cfg.TRAIN.BATCH_SIZE, data=train_data)
     test_loader = data_obj.getTestLoader(data=test_data, test_batch_size=cfg.TRAIN.BATCH_SIZE, seed_id=cfg.RNG_SEED)
 
@@ -278,6 +287,10 @@ def main(cfg):
     print("AL Query Method: {}\nMax AL Episodes: {}\n".format(cfg.ACTIVE_LEARNING.SAMPLING_FN, cfg.ACTIVE_LEARNING.MAX_ITER))
     logger.info("AL Query Method: {}\nMax AL Episodes: {}\n".format(cfg.ACTIVE_LEARNING.SAMPLING_FN, cfg.ACTIVE_LEARNING.MAX_ITER))
 
+
+    eval_steps = np.arange(cfg.ACTIVE_LEARNING.START_ITER, cfg.ACTIVE_LEARNING.MAX_ITER + 1, cfg.ACTIVE_LEARNING.EVAL_FREQUENCY)
+    checkpoint_file = None
+
     for cur_episode in range(0, cfg.ACTIVE_LEARNING.MAX_ITER+1):
 
         print("======== EPISODE {} BEGINS ========\n".format(cur_episode))
@@ -289,8 +302,12 @@ def main(cfg):
             os.mkdir(episode_dir)
         cfg.EPISODE_DIR = episode_dir
 
+
+        train_episode = cur_episode in eval_steps
         checkpoint_file = train_and_eval_model(cfg, cur_episode, lSet_loader, model, optimizer, test_loader,
-                                               valSet_loader)
+                                               valSet_loader, train_episode)
+            # DCoM's delta-s updating
+        Dcom_delta_update(cfg, data_obj, checkpoint_file, lSet, train_data, uSet)
 
         # No need to perform active sampling in the last episode iteration
         if cur_episode == cfg.ACTIVE_LEARNING.MAX_ITER:
@@ -299,13 +316,12 @@ def main(cfg):
             data_obj.saveSet(uSet, 'uSet', cfg.EPISODE_DIR)
             break
 
-        # DCoM's delta-s updating
-        Dcom_delta_update(cfg, data_obj, checkpoint_file, lSet, train_data, uSet)
-
         # Active Sample 
         lSet, lSet_loader, uSet, valSet_loader = active_sampling_part(cfg, checkpoint_file, cur_episode, data_obj, lSet,
                                                                       lSet_loader, train_data, uSet, valSet,
-                                                                      valSet_loader, al_obj)
+                                                                      valSet_loader, al_obj, pseudo_train_data)
+
+
 
         # add avg delta to cfg.ACTIVE_LEARNING.DELTA_LST towards the next active sampling
         if cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ['dcom']:
@@ -328,21 +344,46 @@ def main(cfg):
             os.remove(checkpoint_file)
 
 
+def get_lset_loader(al_obj, cfg, data_obj, lSet, pseudo_train_data, train_data):
+    if cfg.TRAIN_PSEUDO_LABELS:
+        C_matrix = al_obj.sampling_fn.C_general.cpu().numpy()
+        thresh = cfg.PSEUDO_LABELS_THRESHOLD
+        C_norm = C_matrix / np.sum(C_matrix, axis=1)[:, None]
+        max_values_label_indx = np.argmax(C_norm > thresh, axis=1)
+        valid_points_indx = np.where(C_norm[np.arange(50000), max_values_label_indx] > thresh)[0]
+        valid_pseudo_labels = max_values_label_indx[valid_points_indx]
+        print(f"Number of Pseudo Labels = {valid_pseudo_labels.size}")
+        lset_with_pseudo_labels = np.concat([lSet, valid_points_indx])
+        valid_labels = np.array(train_data.targets)
+        valid_labels[valid_points_indx] = valid_pseudo_labels
+        pseudo_train_data.targets = list(valid_labels)
+
+        lSet_loader = data_obj.getIndexesDataLoader(indexes=lset_with_pseudo_labels, batch_size=cfg.TRAIN.BATCH_SIZE,
+                                                    data=pseudo_train_data)
+
+    else:
+        lSet_loader = data_obj.getIndexesDataLoader(indexes=lSet, batch_size=cfg.TRAIN.BATCH_SIZE, data=train_data)
+    return lSet_loader
+
+
 def active_sampling_part(cfg, checkpoint_file, cur_episode, data_obj, lSet, lSet_loader, train_data, uSet, valSet,
-                         valSet_loader, al_obj):
+                         valSet_loader, al_obj, pseudo_train_data):
     print("======== ACTIVE SAMPLING ========\n")
     logger.info("======== ACTIVE SAMPLING ========\n")
     # al_obj = ActiveLearning(data_obj, cfg) if al_obj is None else al_obj
     # clf_model = model_builder.build_model(cfg)
     # clf_model = cu.load_checkpoint(checkpoint_file, clf_model)
-    clf_model = mh.get_model(cfg, checkpoint_file)
+    clf_model = mh.get_model(cfg, checkpoint_file) if checkpoint_file is not None else None
     activeSet, new_uSet = al_obj.sample_from_uSet(clf_model, lSet, uSet, train_data)
     # Save current lSet, new_uSet and activeSet in the episode directory
     data_obj.saveSets(lSet, uSet, activeSet, cfg.EPISODE_DIR)
     # Add activeSet to lSet, save new_uSet as uSet and update dataloader for the next episode
     lSet = np.append(lSet, activeSet)
     uSet = new_uSet
-    lSet_loader = data_obj.getIndexesDataLoader(indexes=lSet, batch_size=cfg.TRAIN.BATCH_SIZE, data=train_data)
+
+    lSet_loader = get_lset_loader(al_obj, cfg, data_obj, lSet, pseudo_train_data, train_data)
+
+    # lSet_loader = data_obj.getIndexesDataLoader(indexes=lSet, batch_size=cfg.TRAIN.BATCH_SIZE, data=train_data)
     valSet_loader = data_obj.getIndexesDataLoader(indexes=valSet, batch_size=cfg.TRAIN.BATCH_SIZE, data=train_data)
     if valSet_loader is None:
         valSet_loader = lSet_loader
@@ -358,14 +399,17 @@ def active_sampling_part(cfg, checkpoint_file, cur_episode, data_obj, lSet, lSet
     return lSet, lSet_loader, uSet, valSet_loader
 
 
-def train_and_eval_model(cfg, cur_episode, lSet_loader, model, optimizer, test_loader, valSet_loader):
+def train_and_eval_model(cfg, cur_episode, lSet_loader, model, optimizer, test_loader, valSet_loader, train_episode=True):
     # Train model
-    print("======== TRAINING ========")
-    logger.info("======== TRAINING ========")
-    best_val_acc, best_val_epoch, checkpoint_file, model = train_model(lSet_loader, valSet_loader, model, optimizer, cfg)
-    print("Best Validation Accuracy: {}\nBest Epoch: {}\n".format(round(best_val_acc, 4), best_val_epoch))
-    logger.info("EPISODE {} Best Validation Accuracy: {}\tBest Epoch: {}\n".format(cur_episode, round(best_val_acc, 4),
-                                                                                   best_val_epoch))
+    if train_episode:
+        print("======== TRAINING ========")
+        logger.info("======== TRAINING ========")
+        best_val_acc, best_val_epoch, checkpoint_file, model = train_model(lSet_loader, valSet_loader, model, optimizer, cfg)
+        print("Best Validation Accuracy: {}\nBest Epoch: {}\n".format(round(best_val_acc, 4), best_val_epoch))
+        logger.info("EPISODE {} Best Validation Accuracy: {}\tBest Epoch: {}\n".format(cur_episode, round(best_val_acc, 4),
+                                                                                       best_val_epoch))
+    else:
+        checkpoint_file = None
     # Test best model checkpoint
     print("======== TESTING ========\n")
     logger.info("======== TESTING ========\n")
@@ -553,10 +597,12 @@ def test_model(test_loader, checkpoint_file, cfg, cur_episode, model):
         preds = model.predict(data)
         test_acc = 100. * (preds == np.array(labels)).mean()
         # return test_acc
-    else:
+    elif checkpoint_file is not None:
         model = mh.get_model(cfg, checkpoint_file)
         test_err = test_epoch(test_loader, model, test_meter, cur_episode)
         test_acc = 100. - test_err
+    else:
+        test_acc = np.nan
 
     plot_episode_xvalues.append(cur_episode)
     plot_episode_yvalues.append(test_acc)
@@ -778,9 +824,12 @@ if __name__ == "__main__":
     cfg.ACTIVE_LEARNING.BUDGET_SIZE = args.budget
     cfg.ACTIVE_LEARNING.INITIAL_DELTA = args.initial_delta
     cfg.KERNEL_TYPE = args.kernel_type
-    cfg.SOFT_BORDER_VAL = args.soft_border_val
     cfg.DIFF_METHOD = args.diff_method
     cfg.CONT_METHOD = args.cont_method
+    cfg.SPARSE_K = args.sparse_K
+    cfg.K_SPARSITY_THRESHOLD = args.K_sparsity_threshold
+    cfg.PSEUDO_LABELS_THRESHOLD = args.pseudo_labels_threshold
+    cfg.TRAIN_PSEUDO_LABELS = args.train_pseudo_labels
     cfg.DECREASING_ALPHA = args.decrease_alpha
     debug = cfg.DEBUG = args.debug
     cfg.HIGH_BUDGET = args.high_budget
@@ -800,6 +849,8 @@ if __name__ == "__main__":
     cfg.ACTIVE_LEARNING.K_LOGISTIC = args.k_logistic
     cfg.EVAL_MODEL_TYPE = args.eval_model_type
     cfg.ACTIVE_LEARNING.MAX_ITER = args.max_iter
+    cfg.ACTIVE_LEARNING.START_ITER = args.start_iter
+    cfg.ACTIVE_LEARNING.EVAL_FREQUENCY = args.eval_frequency
     define_eval_model_type(cfg, debug)
 
     main(cfg)
