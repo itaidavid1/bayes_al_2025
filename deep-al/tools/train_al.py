@@ -107,15 +107,21 @@ def argparser():
     parser.add_argument('--eval_model_type', help='eval_model_type', type=str) # train the eval model from features not images
     # parser.add_argument('--linear_from_features', help='Whether to use a linear layer from self-supervised features', action='store_true') # train the eval model from features not images
     parser.add_argument('--initial_delta', help='Relevant only for ProbCover and DCoM', default=0.6, type=float)
+    parser.add_argument('--initial_sigma', default=1.0, type=float)
     parser.add_argument('--kernel_type', default='rbf', type=str)
     parser.add_argument('--diff_method', default='abs_diff', type=str)
     parser.add_argument('--confidence_method', default='margin', type=str)
     parser.add_argument('--cont_method', default='positive', type=str)
     parser.add_argument('--k_logistic', default=50, type=int)
     parser.add_argument('--a_logistic', default=0.8, type=float)
-    parser.add_argument('--K_sparsity_threshold', default=1.0, type=float)
+    parser.add_argument('--K_sparsity_threshold', default=0.0, type=float)
     parser.add_argument('--pseudo_labels_threshold', default=1.0, type=float)
     parser.add_argument('--train_pseudo_labels', action='store_true')
+    parser.add_argument('--alpha_upper_bound', default=1.0, type=float)
+    parser.add_argument('--alpha_lower_bound', default=1.0, type=float)
+    parser.add_argument('--local_alpha', action='store_true')
+    parser.add_argument('--use_k_top50_mask', action='store_true')
+    parser.add_argument('--update_k_matrix', action='store_true')
     parser.add_argument('--alpha', default=0.5, type=float)
     parser.add_argument('--sparse_K', action='store_true')
     parser.add_argument('--debug', action='store_true')
@@ -823,13 +829,19 @@ if __name__ == "__main__":
     cfg.ACTIVE_LEARNING.SAMPLING_FN = args.al
     cfg.ACTIVE_LEARNING.BUDGET_SIZE = args.budget
     cfg.ACTIVE_LEARNING.INITIAL_DELTA = args.initial_delta
+    cfg.ACTIVE_LEARNING.INITIAL_SIGMA = args.initial_sigma
     cfg.KERNEL_TYPE = args.kernel_type
     cfg.DIFF_METHOD = args.diff_method
     cfg.CONT_METHOD = args.cont_method
     cfg.SPARSE_K = args.sparse_K
-    cfg.K_SPARSITY_THRESHOLD = args.K_sparsity_threshold
+    cfg.K_SPARSITY_THRESHOLD = args.K_sparsity_threshold if  cfg.KERNEL_TYPE != 'tophat' else cfg.ACTIVE_LEARNING.INITIAL_DELTA
     cfg.PSEUDO_LABELS_THRESHOLD = args.pseudo_labels_threshold
     cfg.TRAIN_PSEUDO_LABELS = args.train_pseudo_labels
+    cfg.ALPHA_LOWER_BOUND = args.alpha_lower_bound
+    cfg.ALPHA_UPPER_BOUND = args.alpha_upper_bound
+    cfg.LOCAL_ALPHA = args.local_alpha
+    cfg.USE_K_TOP50_MASK = args.use_k_top50_mask
+    cfg.UPDATE_K_MATRIX = args.update_k_matrix
     cfg.DECREASING_ALPHA = args.decrease_alpha
     debug = cfg.DEBUG = args.debug
     cfg.HIGH_BUDGET = args.high_budget

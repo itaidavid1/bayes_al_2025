@@ -7,7 +7,10 @@ import scipy.sparse as sp
 import pycls.datasets.utils as ds_utils
 from tools.utils import visualize_tsne
 import time
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 from torch.profiler import profile, record_function, ProfilerActivity
+from . import prior_selection
 import matplotlib.pyplot as plt
 ###MISP = maximum importance sampling points
 torch.cuda.empty_cache()
@@ -36,6 +39,16 @@ class RBFKernel(object):
         k = torch.exp(-1.0 * (norm / h) ** 2)
         return k
 
+    def compute_kernel_from_norm(self, norm_matrix, h, matrices_type=torch.float16):
+        k = torch.exp(-1.0 * (norm_matrix / h) ** 2).to(dtype=matrices_type)
+        return k
+
+    def prepare_K_matrix_for_sparsity(self, K_cpu, lset, new_delta):
+        tensor_lset = torch.from_numpy(lset.astype(int))
+        K_cpu[tensor_lset, :] = 0
+        K_cpu[:, tensor_lset] = 0
+        return K_cpu
+
 class TopHatKernel(object):
     def __init__(self, device):
         self.device = device
@@ -55,6 +68,17 @@ class TopHatKernel(object):
         # k = (dist_matrix < h).to(dtype=torch.float16)
         return dist_matrix
 
+    def compute_kernel_from_norm(self, norm_matrix, h, matrices_type=torch.float16):
+        k = (norm_matrix < h).to(dtype=matrices_type)
+        return k
+
+    def prepare_K_matrix_for_sparsity(self, norm_matrix, lset, new_delta):
+        k = (norm_matrix < new_delta).to(dtype=torch.float16)
+        tensor_lset = torch.from_numpy(lset.astype(int))
+        k[tensor_lset, :] = 0
+        k[:, tensor_lset] = 0
+        return k
+
 
 class BAYES_MISP:
     def __init__(self, cfg, budgetSize, train_labels, lset, delta=1):
@@ -72,32 +96,59 @@ class BAYES_MISP:
         self.decrease_alpha = self.cfg.DECREASING_ALPHA if 'DECREASING_ALPHA' in self.cfg else False
         self.budgetSize = budgetSize
         self.K_sparsity_threshold = self.cfg.K_SPARSITY_THRESHOLD
+        self.sigma = cfg.ACTIVE_LEARNING.INITIAL_SIGMA if 'INITIAL_SIGMA' in cfg.ACTIVE_LEARNING else 1.0
+        self.update_K_matrix = self.cfg.UPDATE_K_MATRIX if 'UPDATE_K_MATRIX' in self.cfg else False
+
+        self.use_K_top50_mask = self.cfg.USE_K_TOP50_MASK
+
         self.delta = delta
         self.soft_border_val = self.cfg.SOFT_BORDER_VAL if 'SOFT_BORDER_VAL' in self.cfg else 0.15
 
-        kernel_type = self.cfg.KERNEL_TYPE if 'KERNEL_TYPE' in self.cfg else 'rbf'
-        if kernel_type == 'tophat':
-            self.kernel_fn = TopHatKernel('cuda')
-        else:
-            self.kernel_fn = RBFKernel('cuda')
-
         self.train_labels_general = np.array(train_labels)
         unique_labels = np.unique(self.train_labels_general)
-        self.C_general = torch.full((self.all_features.shape[0], unique_labels.size), self.alpha, device='cuda', dtype=self.matrices_type)
         self.num_of_classes = np.unique(self.train_labels_general).size
+
+        self.alpha_lower = cfg.ALPHA_LOWER_BOUND
+        self.alpha_upper = cfg.ALPHA_UPPER_BOUND
+
+
         self.chosen_labels_num = torch.zeros(self.num_of_classes).to('cuda')
         self.cum_labels_info = torch.zeros(self.num_of_classes).to('cuda')
         self.labeled_points_mask_general = torch.zeros(self.all_features.shape[0], dtype=torch.bool).to('cuda')
         all_features_tensor = torch.from_numpy(self.all_features)
-        self.K_general = self.kernel_fn.compute_kernel(
-                all_features_tensor, all_features_tensor, self.delta, matrices_type=self.matrices_type)
-        del all_features_tensor
+        all_features_dists_cpu = compute_norm(all_features_tensor, all_features_tensor, 'cuda', batch_size=1024,
+                                                  matrices_type=torch.float32).to('cpu')
+        # self.K_general_dense_gpu = self.kernel_fn.compute_kernel(
+        #         all_features_tensor, all_features_tensor, self.delta, matrices_type=self.matrices_type).to('cpu')
+        # self.K_general_dense_cpu = self.K_general_dense_gpu.to('cpu')
 
-        if self.use_sparse:
-            self.K_general[self.K_general < self.K_sparsity_threshold] = 0.0
-            K_coo = sp.coo_matrix(self.K_general)
-            self.K_general = K_coo.tocsr() # notice that K is now scipy csr sparse matrix
-            del K_coo
+        self.kernel_type = self.cfg.KERNEL_TYPE if 'KERNEL_TYPE' in self.cfg else 'rbf'
+        if  self.kernel_type == 'tophat':
+            self.kernel_fn = TopHatKernel('cuda')
+            self.K_general_dense_cpu = self.kernel_fn.compute_kernel_from_norm(
+                all_features_dists_cpu, self.delta, matrices_type=self.matrices_type)
+            self.K_general_backed = all_features_dists_cpu
+        else:
+            self.kernel_fn = RBFKernel('cuda')
+            self.K_general_dense_cpu = self.kernel_fn.compute_kernel_from_norm(
+                    all_features_dists_cpu, self.sigma , matrices_type=self.matrices_type)
+
+            self.K_general_backed = self.K_general_dense_cpu
+        self.total_connections_chosen = 0
+        del all_features_tensor, all_features_dists_cpu
+
+        # self.C_general = torch.full((self.all_features.shape[0], unique_labels.size), self.alpha, device='cuda', dtype=self.matrices_type)
+        if cfg.LOCAL_ALPHA:
+            self.init_C(lset, self.K_general_dense_cpu)
+        else:
+            self.C_general = torch.full((self.all_features.shape[0], unique_labels.size), self.alpha, device='cuda',
+                                        dtype=self.matrices_type)
+
+        self.K_general = self.build_K_general_matrix(self.K_general_dense_cpu)
+
+        self.initial_sparse_index = (int((1 - self.K_general.sum() / (self.all_features.shape[0] ** 2)) *
+                                         self.all_features.shape[0] ** 2) - self.all_features.shape[
+                                         0]) // 2  ### calculate the general sparsity value, then calculate the general initial sparse index (by multiply by the total K size, then remove the self connections (-all_features.shape[0]) and divide by 2 (since the matrix is symmetric)
 
         if lset is not None and lset.size > 0:
             temp_K = self.kernel_fn.compute_kernel(
@@ -111,29 +162,78 @@ class BAYES_MISP:
             del temp_K, curr_labels_sim, class_indices
         torch.cuda.empty_cache()
 
+    def build_K_general_matrix(self, kernel_matrix_cpu):
+        if self.use_sparse:
+            if self.use_K_top50_mask:
+                threshold_mask = kernel_matrix_cpu < self.K_sparsity_threshold
+                K_top50_mask = torch.load(
+                    "/cs/labs/daphna/itai.david/py_repos/TypiClust/results/K_topk_values/cifar100/top50_vals.npz")
+                sparse_mask = K_top50_mask | (~threshold_mask)
+                kernel_matrix_cpu[~sparse_mask] = 0.0
+                del threshold_mask, K_top50_mask, sparse_mask
+            else:
+                # kernel_matrix_cpu[kernel_matrix_cpu < self.K_sparsity_threshold] = 0.0
+                torch.nn.functional.threshold(kernel_matrix_cpu, self.K_sparsity_threshold, 0, inplace=True)
+            K_coo = sp.coo_matrix(kernel_matrix_cpu)
+            K_general = K_coo.tocsr()  # notice that K is now scipy csr sparse matrix
+            del K_coo
+        else:
+            K_general = kernel_matrix_cpu
+        del kernel_matrix_cpu
+
+        return K_general
+
+
+    def get_priors(self, K):
+        # Set sample specific prior
+        # rel_measures = prior_selection.compute_reliability(self.K, self.train_labels, batch_size=8192, normalized=True)
+        rel_measures = prior_selection.compute_clarity_kp(K, self.train_labels_general, self.num_of_classes, batch_size=8192)
+
+        priors = prior_selection.get_temp_priors(rel_measures, lb=self.alpha_lower, ub=self.alpha_upper) # (N,)
+        return priors
+
+    def init_C(self, lset, K):
+        """
+        Init the main matrix C with the priors. If lset != empty, Init C accordingly.
+        NOTE: Attention! float16
+        """
+        if len(lset) > 0:
+            print("Using a method which is not yet tested --- :(")
+            self.load_C_from_lset(lset)
+        self.priors = self.get_priors(K)  # This is (N,) tensor on CPU
+        priors_tensor = torch.as_tensor(self.priors, device='cuda', dtype=torch.float16).unsqueeze(1)  # (N, 1)
+        self.C_general = priors_tensor.repeat(1, self.num_of_classes).to(dtype=self.matrices_type)
+
+        if len(lset) > 0:
+            print("Using a method which is not yet tested --- :(")
+            self.load_C_from_lset(lset)
+
+    def load_C_from_lset(self, lset):
+        """
+        Load matrix C from lset as if lset was labeled in the algorithm process.
+
+        Assumes self.K is already computed.
+        Assumes K is on CPU to save GPU memory.
+        Assumes C is on GPU.
+        """
+        # Since self.features (and K) are sorted as [lset, uset], the indices of lset are simply 0..len(lset)-1
+        lset_indices = np.arange(len(lset))
+        lset_labels = np.array(self.train_labels_general)[lset_indices]
+
+        for label in self.unique_labels:
+            is_label = (lset_labels == label)
+            indices_to_slice = lset_indices[is_label]
+            med_K = self.K[indices_to_slice].to('cuda')
+            self.C[:, label] += torch.sum(med_K, axis=0)
+
+            del med_K
+        torch.cuda.empty_cache()
+
+
     def init_sampling_loop(self,lset, uset):
         torch.cuda.empty_cache()
         self.set_rel_features(lset, uset)
         self.activeSet = []
-        # if self.use_sparse:
-        #     with open("/cs/labs/daphna/itai.david/py_repos/cifar10_data/cifar10_tophat_K_sparse_csr.pkl", "rb") as f:
-        #         K_csr = pickle.load(f)
-        #     K_csr_shuffled = K_csr[self.relevant_indices, :][:, self.relevant_indices]
-        #     crow_indices = torch.from_numpy(K_csr_shuffled.indptr).to(torch.int64)
-        #     col_indices = torch.from_numpy(K_csr_shuffled.indices).to(torch.int64)
-        #     values = torch.from_numpy(K_csr_shuffled.data).to(torch.float32)
-        #
-        #     self.K = torch.sparse_csr_tensor(
-        #         crow_indices=crow_indices,
-        #         col_indices=col_indices,
-        #         values=values,
-        #         size=K_csr_shuffled.shape,
-        #         dtype=values.dtype
-        #     )
-        # else:
-        #     self.K = self.kernel_fn.compute_kernel(
-        #         self.rel_features, self.rel_features, self.delta)
-
         if self.use_sparse:
             # now using scipy csr sparse matrix and convert it to torch csr sparse matrix
             K_csr_shuffled = self.K_general[self.relevant_indices, :][:, self.relevant_indices]
@@ -174,6 +274,24 @@ class BAYES_MISP:
         - selects the sample high the highest out degree (covers most new samples)
 
         """
+
+        ## update general K
+        if len(lset)>0 and len(lset) % 10000 == 0 and self.use_sparse and self.update_K_matrix:
+            torch.cuda.empty_cache()
+            sorted_values = np.load("/cs/labs/daphna/itai.david/py_repos/TypiClust/results/K_sorted_values/cifar100/euclidean_dists_sorted.npy", mmap_mode='r')
+            new_threshold_euclidean_dist = sorted_values[::-1][self.initial_sparse_index-self.total_connections_chosen]
+            if self.kernel_type =='tophat':
+                new_threshold = new_threshold_euclidean_dist
+
+            elif self.kernel_type == 'rbf':
+                new_threshold = torch.exp(-1.0 * (torch.tensor(new_threshold_euclidean_dist) / self.sigma) ** 2)
+            self.K_sparsity_threshold = new_threshold
+            self.K_general_dense_cpu = self.kernel_fn.prepare_K_matrix_for_sparsity(self.K_general_backed, lset, new_threshold)
+            tensor_lset = torch.from_numpy(lset.astype(int))
+            self.K_general_dense_cpu[tensor_lset, :] = 0
+            self.K_general_dense_cpu[:, tensor_lset] = 0
+            del tensor_lset
+            self.K_general = self.build_K_general_matrix(self.K_general_dense_cpu)
 
         self.init_sampling_loop(lset, uset)
 
@@ -247,6 +365,7 @@ class BAYES_MISP:
 
             # self.C[:, chosen_label] = torch.maximum(self.C[:, chosen_label], self.K[sampled_point].squeeze())
             self.cum_labels_info[chosen_label] += K_row_dense.sum()
+            self.total_connections_chosen += torch.sum(K_row_dense > 0).item()
 
             assert sampled_point not in selected, 'sample was already selected'
             selected.append(sampled_point)
@@ -344,7 +463,7 @@ def batched_diffs_efficient_weighted(K: torch.Tensor, C: torch.Tensor, chunk_siz
 
 
 # @torch.compile(backend="inductor")
-def batched_diffs_efficient_weighted_sparse(K_csr: torch.Tensor, C: torch.Tensor, chunk_size: int = 1024, cont_method: str = "positive"):
+def batched_diffs_efficient_weighted_sparse(K_csr: torch.Tensor, C: torch.Tensor, chunk_size: int = 5120, cont_method: str = "positive"):
     D, N = K_csr.shape
     dev = C.device
     crow = K_csr.crow_indices().to(dev)  # shape (D+1,)
@@ -414,6 +533,8 @@ def batched_diffs_efficient_weighted_sparse(K_csr: torch.Tensor, C: torch.Tensor
         negk_expand = negk.expand(classes, -1).T  # (total_nnz, classes)
         new_state = torch.maximum(negk_expand, Cdiff_cols)  # (total_nnz, classes)
 
+        del negk_expand, Cdiff_cols
+
         state_add = maxC_cols + kvals  # (total_nnz,1)
         new_state = new_state + state_add.expand(classes, -1).T  # add per-row scalar across classes
 
@@ -425,6 +546,9 @@ def batched_diffs_efficient_weighted_sparse(K_csr: torch.Tensor, C: torch.Tensor
         mask_expanded = valid_denom.expand(classes, -1).T
         # divide
         new_state = new_state / safe_denom_expanded
+
+        del safe_denom_expanded
+
         new_state = torch.where(mask_expanded, new_state, torch.zeros_like(new_state))
         # new_state = new_state / future_sum.expand(classes, -1).T
         # subtract old_max (per column)
@@ -449,6 +573,7 @@ def batched_diffs_efficient_weighted_sparse(K_csr: torch.Tensor, C: torch.Tensor
 
         # result[i:end] = torch.bmm(new_state_vec, weights_batched.unsqueeze_(2)).sum(dim=1).squeeze(1)
         result[row_start:row_end] = chunk_result
+        torch.cuda.empty_cache()
 
     return result
 

@@ -1,14 +1,15 @@
 #!/bin/bash
 #SBATCH --mem=20g
 #SBATCH -c 2
-#SBATCH --time=0-120
+#SBATCH --time=0-1
 #SBATCH --gres=gg:g0:1,vmem:20g
 #SBATCH --array=0-0
-##SBATCH --killable
-##SBATCH --requeue
+#SBATCH --killable
+#SBATCH --requeue
 #SBATCH --output /cs/labs/daphna/itai.david/py_repos/TypiClust/run_outputs/run_exp_%A_%a.txt
 ## gpu:rtx2080:1, gpu:a10:1
-dir=/cs/labs/daphna/itai.david/py_repos/TypiClust/deep-al/tools
+#dir=/cs/labs/daphna/itai.david/py_repos/TypiClust/deep-al/tools
+dir=/cs/labs/daphna/itai.david/py_repos/TypiClust/deep-al/pycls/al
 
 
 
@@ -22,7 +23,8 @@ source /cs/labs/daphna/itai.david/envs/venv_2705/bin/activate
 #COMMAND_TO_RUN=$(python /cs/labs/daphna/itai.david/py_repos/python_runners/bayes_misp_runner.py ${SLURM_ARRAY_TASK_ID})
 #eval "$COMMAND_TO_RUN"
 
-##python  ./train_al.py --cfg ../configs/cifar100/al/RESNET18.yaml --al all_misp --exp-name auto --initial_size 0 --budget 100 --initial_delta 1.5 --seed $SLURM_ARRAY_TASK_ID --eval_model_type from_features --kernel_type rbf --diff_method prob_method_v1
+python  ./find_kernel_thresholds.py --sigma 0.75
+#python  ./train_al.py --cfg ../configs/cifar100/al/RESNET18.yaml --al all_misp --exp-name auto --initial_size 0 --budget 100 --initial_delta 1.5 --seed $SLURM_ARRAY_TASK_ID --eval_model_type from_features --kernel_type rbf --diff_method prob_method_v1
 ##python  ./train_al.py --cfg ../configs/cifar100/al/RESNET18.yaml --al all_misp --exp-name auto --initial_size 0 --budget 100 --initial_delta 1.75 --seed $SLURM_ARRAY_TASK_ID --eval_model_type from_features --kernel_type rbf --diff_method prob_method_v1
 ##python  ./train_al.py --cfg ../configs/cifar100/al/RESNET18.yaml --al all_misp --exp-name auto --initial_size 0 --budget 100 --initial_delta 0.5 --seed $SLURM_ARRAY_TASK_ID --eval_model_type from_features --kernel_type rbf --diff_method prob_method_v1
 ##python  ./train_al.py --cfg ../configs/cifar100/al/RESNET18.yaml --al all_misp --exp-name auto --initial_size 0 --budget 100 --initial_delta 1 --seed $SLURM_ARRAY_TASK_ID --eval_model_type from_features --kernel_type rbf --diff_method combine_uncert_type_outer_mean

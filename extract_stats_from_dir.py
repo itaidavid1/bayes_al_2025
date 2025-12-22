@@ -45,7 +45,10 @@ ROOT_DIRS = [   '/cs/labs/daphna/itai.david/py_repos/TypiClust/output/CIFAR10/re
               '/cs/labs/daphna/itai.david/py_repos/TypiClust/output/CIFAR10/resnet18/2025_11_7',
               '/cs/labs/daphna/itai.david/py_repos/TypiClust/output/CIFAR10/resnet18/2025_11_10',
     '/cs/labs/daphna/itai.david/py_repos/TypiClust/output/CIFAR10/resnet18/2025_11_11',
-             '/cs/labs/daphna/itai.david/py_repos/TypiClust/output/CIFAR10/resnet18/2025_11_12']
+             '/cs/labs/daphna/itai.david/py_repos/TypiClust/output/CIFAR10/resnet18/2025_11_12',
+             '/cs/labs/daphna/itai.david/py_repos/TypiClust/output/CIFAR10/resnet18/2025_11_13',
+             '/cs/labs/daphna/itai.david/py_repos/TypiClust/output/CIFAR10/resnet18/2025_11_15',
+                ]
 
 # ROOT_DIRS = [ '/cs/labs/daphna/itai.david/py_repos/TypiClust/output/CIFAR10/resnet18/2025_10_26',
 #              '/cs/labs/daphna/itai.david/py_repos/TypiClust/output/CIFAR10/resnet18/2025_10_23',
