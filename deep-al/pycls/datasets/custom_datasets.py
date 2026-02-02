@@ -13,6 +13,9 @@ class CIFAR10(torchvision.datasets.CIFAR10):
         self.no_aug = False
         self.only_features = only_features
         self.features = ds_utils.load_features("CIFAR10", train=train, normalized=False)
+        self.return_index = False
+        self.pseudo_mask = None
+        self.pseudo_weights = None
 
 
     def __getitem__(self, index: int):
@@ -39,6 +42,8 @@ class CIFAR10(torchvision.datasets.CIFAR10):
                     img = self.transform(img)
 
 
+        if self.return_index:
+            return img, target, index
         return img, target
 
 
@@ -49,6 +54,9 @@ class CIFAR100(torchvision.datasets.CIFAR100):
         self.no_aug = False
         self.only_features = only_features
         self.features = ds_utils.load_features("CIFAR100", train=train, normalized=False)
+        self.return_index = False
+        self.pseudo_mask = None
+        self.pseudo_weights = None
 
     def __getitem__(self, index: int):
         """
@@ -73,6 +81,8 @@ class CIFAR100(torchvision.datasets.CIFAR100):
                 if self.transform is not None:
                     img = self.transform(img)
 
+        if self.return_index:
+            return img, target, index
         return img, target
 
 
@@ -82,6 +92,9 @@ class STL10(torchvision.datasets.STL10):
         self.test_transform = test_transform
         self.no_aug = False
         self.targets = self.labels
+        self.return_index = False
+        self.pseudo_mask = None
+        self.pseudo_weights = None
 
     def __getitem__(self, index: int):
         """
@@ -104,6 +117,8 @@ class STL10(torchvision.datasets.STL10):
             if self.transform is not None:
                 img = self.transform(img)
 
+        if self.return_index:
+            return img, target, index
         return img, target
 
 
@@ -112,6 +127,9 @@ class MNIST(torchvision.datasets.MNIST):
         super(MNIST, self).__init__(root, train, transform=transform, download=download)
         self.test_transform = test_transform
         self.no_aug = False
+        self.return_index = False
+        self.pseudo_mask = None
+        self.pseudo_weights = None
 
     def __getitem__(self, index: int):
         """
@@ -135,6 +153,8 @@ class MNIST(torchvision.datasets.MNIST):
                 img = self.transform(img)
 
 
+        if self.return_index:
+            return img, target, index
         return img, target
 
 
@@ -143,6 +163,9 @@ class SVHN(torchvision.datasets.SVHN):
         super(SVHN, self).__init__(root, train, transform=transform, download=download)
         self.test_transform = test_transform
         self.no_aug = False
+        self.return_index = False
+        self.pseudo_mask = None
+        self.pseudo_weights = None
 
     def __getitem__(self, index: int):
         """
@@ -166,6 +189,8 @@ class SVHN(torchvision.datasets.SVHN):
                 img = self.transform(img)
 
 
+        if self.return_index:
+            return img, target, index
         return img, target
 
 

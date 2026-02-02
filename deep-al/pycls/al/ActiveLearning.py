@@ -91,28 +91,7 @@ class ActiveLearning:
                             delta=self.cfg.ACTIVE_LEARNING.INITIAL_DELTA)
             activeSet, uSet = probcov.select_samples()
             # probcov.plot_tsne()
-        elif self.cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["misp"]:
-            from .MISP import  MISP
 
-            misp = MISP(self.cfg, lSet, uSet, budgetSize=self.cfg.ACTIVE_LEARNING.BUDGET_SIZE,
-                        delta=self.cfg.ACTIVE_LEARNING.INITIAL_DELTA)
-            activeSet, uSet = misp.select_samples()
-            # misp.plot_tsne()
-
-        elif self.cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["mispc"]:
-            from .MISP_probcover import MISPC
-
-            misp = MISPC(self.cfg, lSet, uSet, budgetSize=self.cfg.ACTIVE_LEARNING.BUDGET_SIZE,
-                        delta=self.cfg.ACTIVE_LEARNING.INITIAL_DELTA)
-            activeSet, uSet = misp.select_samples()
-            # misp.plot_tsne()
-        elif self.cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["misp_plus"]:
-            from .MISP_plus import MISP_PLUS
-
-            mispp = MISP_PLUS(self.cfg, lSet, uSet, budgetSize=self.cfg.ACTIVE_LEARNING.BUDGET_SIZE, train_data=trainDataset,
-                        delta=self.cfg.ACTIVE_LEARNING.INITIAL_DELTA)
-            activeSet, uSet = mispp.select_samples()
-            # misp.plot_tsne()
         elif self.cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["maxherding", "max_herding"]:
             from .maxherding import MaxHerding
             delta = self.cfg.ACTIVE_LEARNING.INITIAL_DELTA
@@ -161,25 +140,13 @@ class ActiveLearning:
             return probcov
             activeSet, uSet = probcov.select_samples(lSet, uSet)
             # probcov.plot_tsne()
-        elif self.cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["misp"]:
-            from .MISP import  MISP
 
-            misp = MISP(self.cfg, budgetSize=self.cfg.ACTIVE_LEARNING.BUDGET_SIZE,
-                        delta=self.cfg.ACTIVE_LEARNING.INITIAL_DELTA)
-            return misp
-        elif self.cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["max_misp"]:
-            from .MAX_MISP import  MAX_MISP
-
-            max_misp = MAX_MISP(self.cfg, budgetSize=self.cfg.ACTIVE_LEARNING.BUDGET_SIZE,
-                        delta=self.cfg.ACTIVE_LEARNING.INITIAL_DELTA)
-            return max_misp
-
-        elif self.cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["all_misp"]:
-            from .ALL_MISP import  ALL_MISP
-
-            all_misp = ALL_MISP(self.cfg, budgetSize=self.cfg.ACTIVE_LEARNING.BUDGET_SIZE,
+        elif self.cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["prob_cover_matrix"]:
+            from .coverage_matrix_methods import CoverageMatrixMethod
+            cmm = CoverageMatrixMethod(self.cfg, budgetSize=self.cfg.ACTIVE_LEARNING.BUDGET_SIZE,
                         train_labels= train_labels, delta=self.cfg.ACTIVE_LEARNING.INITIAL_DELTA, lset=lset)
-            return all_misp
+            return cmm
+
 
         elif self.cfg.ACTIVE_LEARNING.SAMPLING_FN.lower() in ["bayes_misp"]:
             from .BAYES_MISP import BAYES_MISP

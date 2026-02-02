@@ -9,11 +9,11 @@ _loss_funs = {
     'cross_entropy': nn.CrossEntropyLoss,
 }
 
-def get_loss_fun():
+def get_loss_fun(reduction="mean"):
     """Retrieves the loss function."""
     assert cfg.MODEL.LOSS_FUN in _loss_funs.keys(), \
         'Loss function \'{}\' not supported'.format(cfg.TRAIN.LOSS)
-    return _loss_funs[cfg.MODEL.LOSS_FUN]().cuda()
+    return _loss_funs[cfg.MODEL.LOSS_FUN](reduction=reduction).cuda()
 
 
 def register_loss_fun(name, ctor):

@@ -112,6 +112,8 @@ def argparser():
     parser.add_argument('--diff_method', default='abs_diff', type=str)
     parser.add_argument('--confidence_method', default='margin', type=str)
     parser.add_argument('--cont_method', default='positive', type=str)
+    parser.add_argument('--distribution_cont_weight_method', default='weighted', type=str)
+    parser.add_argument('--class_weighting_method', default='none', type=str)
     parser.add_argument('--k_logistic', default=50, type=int)
     parser.add_argument('--a_logistic', default=0.8, type=float)
     parser.add_argument('--K_sparsity_threshold', default=0.0, type=float)
@@ -120,6 +122,7 @@ def argparser():
     parser.add_argument('--alpha_upper_bound', default=1.0, type=float)
     parser.add_argument('--alpha_lower_bound', default=1.0, type=float)
     parser.add_argument('--local_alpha', action='store_true')
+    parser.add_argument('--local_alpha_oracle_method', default='entropy', type=str)
     parser.add_argument('--use_k_top50_mask', action='store_true')
     parser.add_argument('--update_k_matrix', action='store_true')
     parser.add_argument('--alpha', default=0.5, type=float)
@@ -132,6 +135,8 @@ def argparser():
     parser.add_argument('--max_iter', default=32, type=int)
     parser.add_argument('--start_iter', default=0, type=int)
     parser.add_argument('--eval_frequency', default=1, type=int)
+    parser.add_argument('--pseudo_label_weight', default=0.5, type=float)
+    parser.add_argument('--pseudo_label_weighting_func', choices=['constant', 'dynamic'], default='constant', type=str)
 
     return parser
 
@@ -356,18 +361,44 @@ def get_lset_loader(al_obj, cfg, data_obj, lSet, pseudo_train_data, train_data):
         thresh = cfg.PSEUDO_LABELS_THRESHOLD
         C_norm = C_matrix / np.sum(C_matrix, axis=1)[:, None]
         max_values_label_indx = np.argmax(C_norm > thresh, axis=1)
-        valid_points_indx = np.where(C_norm[np.arange(50000), max_values_label_indx] > thresh)[0]
+        valid_points_indx = np.where(C_norm[np.arange(C_norm.shape[0]), max_values_label_indx] > thresh)[0]
         valid_pseudo_labels = max_values_label_indx[valid_points_indx]
+        # keep only points not already in lSet
+        new_mask = ~np.isin(valid_points_indx, lSet)
+        valid_points_indx = valid_points_indx[new_mask]
+        valid_pseudo_labels = valid_pseudo_labels[new_mask]
+
+        print(f"Number of Pseudo labels {valid_points_indx.size}\n")
+        if valid_points_indx.size == 0:
+            # fall back to original loader without adding pseudo-labeled samples
+            train_data.return_index = True
+            train_data.pseudo_mask = None
+            train_data.pseudo_weights = None
+            return data_obj.getIndexesDataLoader(indexes=lSet, batch_size=cfg.TRAIN.BATCH_SIZE, data=train_data)
         print(f"Number of Pseudo Labels = {valid_pseudo_labels.size}")
-        lset_with_pseudo_labels = np.concat([lSet, valid_points_indx])
+        lset_with_pseudo_labels = np.concatenate([lSet, valid_points_indx])
         valid_labels = np.array(train_data.targets)
         valid_labels[valid_points_indx] = valid_pseudo_labels
         pseudo_train_data.targets = list(valid_labels)
+
+        # track which samples are pseudo-labeled
+        pseudo_mask = np.zeros(len(train_data.targets), dtype=bool)
+        pseudo_mask[valid_points_indx] = True
+        pseudo_train_data.pseudo_mask = pseudo_mask
+        pseudo_weights = None
+        if cfg.PSEUDO_LABEL_WEIGHTING_FUNC == 'dynamic':
+            pseudo_weights = np.ones(len(train_data.targets), dtype=np.float32)
+            pseudo_weights[valid_points_indx] = C_norm[valid_points_indx, valid_pseudo_labels]
+        pseudo_train_data.pseudo_weights = pseudo_weights
+        pseudo_train_data.return_index = True
 
         lSet_loader = data_obj.getIndexesDataLoader(indexes=lset_with_pseudo_labels, batch_size=cfg.TRAIN.BATCH_SIZE,
                                                     data=pseudo_train_data)
 
     else:
+        train_data.return_index = True
+        train_data.pseudo_mask = None
+        train_data.pseudo_weights = None
         lSet_loader = data_obj.getIndexesDataLoader(indexes=lSet, batch_size=cfg.TRAIN.BATCH_SIZE, data=train_data)
     return lSet_loader
 
@@ -474,7 +505,7 @@ def train_model(train_loader, val_loader, model, optimizer, cfg):
         return test_acc, 0, None, model
 
     start_epoch = 0
-    loss_fun = losses.get_loss_fun()
+    loss_fun = losses.get_loss_fun(reduction="none")
 
     # Create meters
     train_meter = TrainMeter(len(train_loader))
@@ -651,14 +682,29 @@ def train_epoch(train_loader, model, loss_fun, optimizer, train_meter, cur_epoch
     train_meter.iter_tic() #This basically notes the start time in timer class defined in utils/timer.py
 
     len_train_loader = len(train_loader)
-    for cur_iter, (inputs, labels) in enumerate(train_loader):
+    for cur_iter, batch in enumerate(train_loader):
+        if len(batch) == 3:
+            inputs, labels, idx = batch
+        else:
+            inputs, labels = batch
+            idx = None
         #ensuring that inputs are floatTensor as model weights are
         inputs = inputs.type(torch.cuda.FloatTensor)
         inputs, labels = inputs.cuda(), labels.cuda(non_blocking=True)
+        use_dynamic = getattr(cfg, "PSEUDO_LABEL_WEIGHTING_FUNC", "constant") == "dynamic"
+        if use_dynamic and idx is not None and hasattr(train_loader.dataset, "pseudo_weights") and train_loader.dataset.pseudo_weights is not None:
+            sample_weights = torch.as_tensor(train_loader.dataset.pseudo_weights[idx], device=labels.device, dtype=torch.float32)
+        else:
+            if idx is not None and hasattr(train_loader.dataset, "pseudo_mask") and train_loader.dataset.pseudo_mask is not None:
+                is_pseudo = torch.as_tensor(train_loader.dataset.pseudo_mask[idx], device=labels.device, dtype=torch.bool)
+            else:
+                is_pseudo = torch.zeros_like(labels, dtype=torch.bool)
+            sample_weights = torch.where(is_pseudo, torch.tensor(cfg.PSEUDO_LABEL_WEIGHT, device=labels.device), 1.0)
         # Perform the forward pass
         preds = model(inputs)
         # Compute the loss
-        loss = loss_fun(preds, labels)
+        raw_loss = loss_fun(preds, labels)
+        loss = (raw_loss * sample_weights).mean()
         # Perform the backward pass
         optimizer.zero_grad()
         loss.backward()
@@ -738,7 +784,11 @@ def test_epoch(test_loader, model, test_meter, cur_epoch):
     misclassifications = 0.
     totalSamples = 0.
 
-    for cur_iter, (inputs, labels) in enumerate(test_loader):
+    for cur_iter, batch in enumerate(test_loader):
+        if len(batch) == 3:
+            inputs, labels, _ = batch
+        else:
+            inputs, labels = batch
         with torch.no_grad():
             # Transfer the data to the current GPU device
             inputs, labels = inputs.cuda(), labels.cuda(non_blocking=True)
@@ -781,7 +831,11 @@ def get_label_epoch(images_loader, model, get_label_meter):
     get_label_meter.iter_tic()
 
     all_preds = []
-    for cur_iter, (inputs, _) in enumerate(images_loader):
+    for cur_iter, batch in enumerate(images_loader):
+        if len(batch) == 3:
+            inputs, _, _ = batch
+        else:
+            inputs, _ = batch
         with torch.no_grad():
             # Transfer the data to the current GPU device
             inputs = inputs.cuda().type(torch.cuda.FloatTensor)
@@ -833,6 +887,9 @@ if __name__ == "__main__":
     cfg.KERNEL_TYPE = args.kernel_type
     cfg.DIFF_METHOD = args.diff_method
     cfg.CONT_METHOD = args.cont_method
+    cfg.DISTRIBUTION_CONT_WEIGHT_METHOD = args.distribution_cont_weight_method
+    cfg.CLASS_WEIGHTING_METHOD = args.class_weighting_method
+
     cfg.SPARSE_K = args.sparse_K
     cfg.K_SPARSITY_THRESHOLD = args.K_sparsity_threshold if  cfg.KERNEL_TYPE != 'tophat' else cfg.ACTIVE_LEARNING.INITIAL_DELTA
     cfg.PSEUDO_LABELS_THRESHOLD = args.pseudo_labels_threshold
@@ -840,6 +897,7 @@ if __name__ == "__main__":
     cfg.ALPHA_LOWER_BOUND = args.alpha_lower_bound
     cfg.ALPHA_UPPER_BOUND = args.alpha_upper_bound
     cfg.LOCAL_ALPHA = args.local_alpha
+    cfg.LOCAL_ALPHA_ORACLE_METHOD = args.local_alpha_oracle_method
     cfg.USE_K_TOP50_MASK = args.use_k_top50_mask
     cfg.UPDATE_K_MATRIX = args.update_k_matrix
     cfg.DECREASING_ALPHA = args.decrease_alpha
@@ -853,6 +911,8 @@ if __name__ == "__main__":
     cfg.ALPHA = args.alpha
     cfg.NORM_IMPORTANCE = args.norm_importance
     cfg.SPARSE_DS = args.sparse_ds
+    cfg.PSEUDO_LABEL_WEIGHT = args.pseudo_label_weight
+    cfg.PSEUDO_LABEL_WEIGHTING_FUNC = args.pseudo_label_weighting_func
     # cfg.OWN_ALPHA_WEIGHTING = args.own_alpha_weighting
 
     print("RNG_SEED is set to {}".format(cfg.RNG_SEED))

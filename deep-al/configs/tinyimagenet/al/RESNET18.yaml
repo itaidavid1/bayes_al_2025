@@ -2,7 +2,7 @@
 RNG_SEED: 1
 DATASET:
   NAME: TINYIMAGENET 
-  ROOT_DIR: '/path/to/dataset/directory/'
+  ROOT_DIR: 'data/tiny-imagenet-200/tiny-imagenet-200'
   VAL_RATIO: 0.05
   AUG_METHOD: 'hflip'
 MODEL:
@@ -35,7 +35,8 @@ CUDNN:
 ACTIVE_LEARNING:
   INIT_L_RATIO: 0.1
   BUDGET_SIZE: 5000
+  FINE_TUNE: False
   # SAMPLING_FN: 'uncertainty'
-  MAX_ITER: 5
+  MAX_ITER: 32
   DELTA_RESOLUTION: 0.05
   MAX_DELTA: 1.1
