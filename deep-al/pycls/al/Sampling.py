@@ -289,6 +289,70 @@ class Sampling:
         return activeSet, uSet
 
 
+    def random_1c(self, uSet, budgetSize, dataset, train_labels):
+        """
+        Chooses exactly 1 random data point per class from uSet.
+        For each class present in the unlabeled set, randomly selects one sample.
+        
+        NOTE: The returned uSet is modified such that it does not contain active datapoints.
+        NOTE: budgetSize parameter is ignored - the number of samples returned equals the number of classes.
+
+        INPUT
+        ------
+
+        uSet: np.ndarray, It describes the index set of unlabelled set.
+
+        budgetSize: int, Ignored for this sampling function.
+
+        dataset: The dataset object containing the data.
+
+        train_labels: List or array of labels for the entire training set.
+
+        OUTPUT
+        -------
+
+        Returns activeSet, uSet   
+        """
+
+        np.random.seed(self.cfg.RNG_SEED)
+
+        assert isinstance(uSet, np.ndarray), "Expected uSet of type np.ndarray whereas provided is dtype:{}".format(type(uSet))
+        
+        # Get labels for samples in uSet
+        uSet_labels = np.array(train_labels)[uSet.astype(int)]
+        
+        # Find unique classes in uSet
+        unique_classes = np.unique(uSet_labels)
+        num_classes = len(unique_classes)
+        
+        print(f"random_1c: Found {num_classes} classes in uSet. Selecting 1 random sample per class.")
+        
+        # For each class, randomly select one sample
+        selected_indices = []
+        for class_label in unique_classes:
+            # Find all samples of this class in uSet
+            class_mask = (uSet_labels == class_label)
+            class_indices = np.where(class_mask)[0]
+            
+            # Randomly select one index from this class
+            random_idx = np.random.choice(class_indices)
+            selected_indices.append(random_idx)
+        
+        selected_indices = np.array(selected_indices)
+        
+        # Create activeSet from selected indices
+        activeSet = uSet[selected_indices]
+        
+        # Remove selected indices from uSet
+        remaining_mask = np.ones(len(uSet), dtype=bool)
+        remaining_mask[selected_indices] = False
+        uSet = uSet[remaining_mask]
+        
+        print(f"random_1c: Selected {len(activeSet)} samples (1 per class).")
+        
+        return activeSet, uSet
+
+
     def bald(self, budgetSize, uSet, clf_model, dataset):
         "Implements BALD acquisition function where we maximize information gain."
 
@@ -478,33 +542,49 @@ class Sampling:
         Implements the uncertainty principle as a acquisition function.
         """
         num_classes = self.cfg.MODEL.NUM_CLASSES
-        assert model.training == False, "Model expected in eval mode whereas currently it is in {}".format(model.training)
         
-        clf = model.cuda()
+        # Handle sklearn models differently
+        if self.cfg.EVAL_MODEL_TYPE == 'from_mlp_sklearn':
+            from sklearn.utils.validation import check_is_fitted
+            try:
+                check_is_fitted(model)
+            except:
+                print("WARNING: sklearn model not fitted yet, returning random selection")
+                return self.random(uSet=uSet, budgetSize=budgetSize)
+            
+            # sklearn models work with features directly
+            u_features = dataset.features[uSet.astype(int)]
+            probs = model.predict_proba(u_features)
+            
+            # Calculate uncertainty: 1 - max_probability
+            max_probs = np.max(probs, axis=1)
+            u_ranks = 1 - max_probs
+            
+        else:
+            # PyTorch model path
+            assert model.training == False, "Model expected in eval mode whereas currently it is in {}".format(model.training)
+            
+            clf = model.cuda()
+            
+            u_ranks = []
+            uSetLoader = self.dataObj.getSequentialDataLoader(indexes=uSet, batch_size=int(self.cfg.TRAIN.BATCH_SIZE),data=dataset)
+            uSetLoader.dataset.no_aug = True
+
+            n_uLoader = len(uSetLoader)
+            print("len(uSetLoader): {}".format(n_uLoader))
+            for i, (x_u, _) in enumerate(tqdm(uSetLoader, desc="uSet Activations")):
+                with torch.no_grad():
+                    x_u = x_u.cuda(0)
+
+                    temp_u_rank = torch.nn.functional.softmax(clf(x_u), dim=1)
+                    temp_u_rank, _ = torch.max(temp_u_rank, dim=1)
+                    temp_u_rank = 1 - temp_u_rank
+                    u_ranks.append(temp_u_rank.detach().cpu().numpy())
+
+            u_ranks = np.concatenate(u_ranks, axis=0)
+            uSetLoader.dataset.no_aug = False
         
-        u_ranks = []
-        # if self.cfg.TRAIN.DATASET == "IMAGENET":
-        #     print("Loading the model in data parallel where num_GPUS: {}".format(self.cfg.NUM_GPUS))
-        #     clf = torch.nn.DataParallel(clf, device_ids = [i for i in range(self.cfg.NUM_GPUS)])
-        #     uSetLoader = imagenet_loader.construct_loader_no_aug(cfg=self.cfg, indices=uSet, isDistributed=False, isShuffle=False, isVaalSampling=False)
-        # else:
-        uSetLoader = self.dataObj.getSequentialDataLoader(indexes=uSet, batch_size=int(self.cfg.TRAIN.BATCH_SIZE),data=dataset)
-        uSetLoader.dataset.no_aug = True
-
-        n_uLoader = len(uSetLoader)
-        print("len(uSetLoader): {}".format(n_uLoader))
-        for i, (x_u, _) in enumerate(tqdm(uSetLoader, desc="uSet Activations")):
-            with torch.no_grad():
-                x_u = x_u.cuda(0)
-
-                temp_u_rank = torch.nn.functional.softmax(clf(x_u), dim=1)
-                temp_u_rank, _ = torch.max(temp_u_rank, dim=1)
-                temp_u_rank = 1 - temp_u_rank
-                u_ranks.append(temp_u_rank.detach().cpu().numpy())
-
-        u_ranks = np.concatenate(u_ranks, axis=0)
         # Now u_ranks has shape: [U_Size x 1]
-
         # index of u_ranks serve as key to refer in u_idx
         print(f"u_ranks.shape: {u_ranks.shape}")
         # we add -1 for reversing the sorted array
@@ -513,7 +593,6 @@ class Sampling:
 
         activeSet = uSet[activeSet]
         remainSet = uSet[sorted_idx[budgetSize:]]
-        uSetLoader.dataset.no_aug = False
         return activeSet, remainSet
 
 
@@ -523,32 +602,48 @@ class Sampling:
         Implements the uncertainty principle as a acquisition function.
         """
         num_classes = self.cfg.MODEL.NUM_CLASSES
-        assert model.training == False, "Model expected in eval mode whereas currently it is in {}".format(model.training)
+        
+        # Handle sklearn models differently
+        if self.cfg.EVAL_MODEL_TYPE == 'from_mlp_sklearn':
+            from sklearn.utils.validation import check_is_fitted
+            try:
+                check_is_fitted(model)
+            except:
+                print("WARNING: sklearn model not fitted yet, returning random selection")
+                return self.random(uSet=uSet, budgetSize=budgetSize)
+            
+            # sklearn models work with features directly
+            u_features = dataset.features[uSet.astype(int)]
+            probs = model.predict_proba(u_features)
+            
+            # Calculate entropy: -sum(p * log2(p))
+            probs = np.clip(probs, 1e-10, 1.0)  # Avoid log(0)
+            u_ranks = -np.sum(probs * np.log2(probs), axis=1)
+            
+        else:
+            # PyTorch model path
+            assert model.training == False, "Model expected in eval mode whereas currently it is in {}".format(model.training)
 
-        clf = model.cuda()
+            clf = model.cuda()
 
-        u_ranks = []
-        # if self.cfg.TRAIN.DATASET == "IMAGENET":
-        #     print("Loading the model in data parallel where num_GPUS: {}".format(self.cfg.NUM_GPUS))
-        #     clf = torch.nn.DataParallel(clf, device_ids = [i for i in range(self.cfg.NUM_GPUS)])
-        #     uSetLoader = imagenet_loader.construct_loader_no_aug(cfg=self.cfg, indices=uSet, isDistributed=False, isShuffle=False, isVaalSampling=False)
-        # else:
-        uSetLoader = self.dataObj.getSequentialDataLoader(indexes=uSet, batch_size=int(self.cfg.TRAIN.BATCH_SIZE), data=dataset)
-        uSetLoader.dataset.no_aug = True
+            u_ranks = []
+            uSetLoader = self.dataObj.getSequentialDataLoader(indexes=uSet, batch_size=int(self.cfg.TRAIN.BATCH_SIZE), data=dataset)
+            uSetLoader.dataset.no_aug = True
 
-        n_uLoader = len(uSetLoader)
-        print("len(uSetLoader): {}".format(n_uLoader))
-        for i, (x_u, _) in enumerate(tqdm(uSetLoader, desc="uSet Activations")):
-            with torch.no_grad():
-                x_u = x_u.cuda(0)
+            n_uLoader = len(uSetLoader)
+            print("len(uSetLoader): {}".format(n_uLoader))
+            for i, (x_u, _) in enumerate(tqdm(uSetLoader, desc="uSet Activations")):
+                with torch.no_grad():
+                    x_u = x_u.cuda(0)
 
-                temp_u_rank = torch.nn.functional.softmax(clf(x_u), dim=1)
-                temp_u_rank = temp_u_rank * torch.log2(temp_u_rank)
-                temp_u_rank = -1*torch.sum(temp_u_rank, dim=1)
-                u_ranks.append(temp_u_rank.detach().cpu().numpy())
-        u_ranks = np.concatenate(u_ranks, axis=0)
+                    temp_u_rank = torch.nn.functional.softmax(clf(x_u), dim=1)
+                    temp_u_rank = temp_u_rank * torch.log2(temp_u_rank)
+                    temp_u_rank = -1*torch.sum(temp_u_rank, dim=1)
+                    u_ranks.append(temp_u_rank.detach().cpu().numpy())
+            u_ranks = np.concatenate(u_ranks, axis=0)
+            uSetLoader.dataset.no_aug = False
+        
         # Now u_ranks has shape: [U_Size x 1]
-
         # index of u_ranks serve as key to refer in u_idx
         print(f"u_ranks.shape: {u_ranks.shape}")
         # we add -1 for reversing the sorted array
@@ -557,7 +652,6 @@ class Sampling:
 
         activeSet = uSet[activeSet]
         remainSet = uSet[sorted_idx[budgetSize:]]
-        uSetLoader.dataset.no_aug = False
         return activeSet, remainSet
 
 
@@ -567,34 +661,52 @@ class Sampling:
         Implements the uncertainty principle as a acquisition function.
         """
         num_classes = self.cfg.MODEL.NUM_CLASSES
-        assert model.training == False, "Model expected in eval mode whereas currently it is in {}".format(model.training)
+        
+        # Handle sklearn models differently
+        if self.cfg.EVAL_MODEL_TYPE == 'from_mlp_sklearn':
+            from sklearn.utils.validation import check_is_fitted
+            try:
+                check_is_fitted(model)
+            except:
+                print("WARNING: sklearn model not fitted yet, returning random selection")
+                return self.random(uSet=uSet, budgetSize=budgetSize)
+            
+            # sklearn models work with features directly
+            u_features = dataset.features[uSet.astype(int)]
+            probs = model.predict_proba(u_features)
+            
+            # Calculate margin: difference between top 2 probabilities
+            probs_sorted = np.sort(probs, axis=1)[:, ::-1]  # Sort descending
+            margin = probs_sorted[:, 0] - probs_sorted[:, 1]
+            # for code consistency, negate to pick datapoints with max value (smallest margin)
+            u_ranks = -1 * margin
+            
+        else:
+            # PyTorch model path
+            assert model.training == False, "Model expected in eval mode whereas currently it is in {}".format(model.training)
 
-        clf = model.cuda()
+            clf = model.cuda()
 
-        u_ranks = []
-        # if self.cfg.TRAIN.DATASET == "IMAGENET":
-        #     print("Loading the model in data parallel where num_GPUS: {}".format(self.cfg.NUM_GPUS))
-        #     clf = torch.nn.DataParallel(clf, device_ids = [i for i in range(self.cfg.NUM_GPUS)])
-        #     uSetLoader = imagenet_loader.construct_loader_no_aug(cfg=self.cfg, indices=uSet, isDistributed=False, isShuffle=False, isVaalSampling=False)
-        # else:
-        uSetLoader = self.dataObj.getSequentialDataLoader(indexes=uSet, batch_size=int(self.cfg.TRAIN.BATCH_SIZE), data=dataset)
-        uSetLoader.dataset.no_aug = True
+            u_ranks = []
+            uSetLoader = self.dataObj.getSequentialDataLoader(indexes=uSet, batch_size=int(self.cfg.TRAIN.BATCH_SIZE), data=dataset)
+            uSetLoader.dataset.no_aug = True
 
-        n_uLoader = len(uSetLoader)
-        print("len(uSetLoader): {}".format(n_uLoader))
-        for i, (x_u, _) in enumerate(tqdm(uSetLoader, desc="uSet Activations")):
-            with torch.no_grad():
-                x_u = x_u.cuda(0)
+            n_uLoader = len(uSetLoader)
+            print("len(uSetLoader): {}".format(n_uLoader))
+            for i, (x_u, _) in enumerate(tqdm(uSetLoader, desc="uSet Activations")):
+                with torch.no_grad():
+                    x_u = x_u.cuda(0)
 
-                temp_u_rank = torch.nn.functional.softmax(clf(x_u), dim=1)
-                temp_u_rank, _ = torch.sort(temp_u_rank, descending=True)
-                difference = temp_u_rank[:, 0] - temp_u_rank[:, 1]
-                # for code consistency across uncertainty, entropy methods i.e., picking datapoints with max value  
-                difference = -1*difference 
-                u_ranks.append(difference.detach().cpu().numpy())
-        u_ranks = np.concatenate(u_ranks, axis=0)
+                    temp_u_rank = torch.nn.functional.softmax(clf(x_u), dim=1)
+                    temp_u_rank, _ = torch.sort(temp_u_rank, descending=True)
+                    difference = temp_u_rank[:, 0] - temp_u_rank[:, 1]
+                    # for code consistency across uncertainty, entropy methods i.e., picking datapoints with max value  
+                    difference = -1*difference 
+                    u_ranks.append(difference.detach().cpu().numpy())
+            u_ranks = np.concatenate(u_ranks, axis=0)
+            uSetLoader.dataset.no_aug = False
+        
         # Now u_ranks has shape: [U_Size x 1]
-
         # index of u_ranks serve as key to refer in u_idx
         print(f"u_ranks.shape: {u_ranks.shape}")
         # we add -1 for reversing the sorted array
@@ -603,7 +715,6 @@ class Sampling:
 
         activeSet = uSet[activeSet]
         remainSet = uSet[sorted_idx[budgetSize:]]
-        uSetLoader.dataset.no_aug = False
         return activeSet, remainSet
 
 

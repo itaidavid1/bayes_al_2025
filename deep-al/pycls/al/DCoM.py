@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import torch
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.exceptions import NotFittedError
 import pycls.datasets.utils as ds_utils
 from tqdm import tqdm
 
@@ -237,31 +238,65 @@ class DCoM:
         return np.array(result_df)
 
     def calculate_margin(self, model, train_data, data_obj):
-        oldmode = model.training
-        model.eval()
+        # Check if model is PyTorch or sklearn
+        is_pytorch_model = hasattr(model, 'training')
+        
+        # Check if sklearn model is fitted
+        if not is_pytorch_model:
+            try:
+                from sklearn.utils.validation import check_is_fitted
+                check_is_fitted(model)
+            except (NotFittedError, AttributeError):
+                print(f'Model is not fitted yet. Returning uniform margin scores.')
+                # Return uniform scores (all zeros) so selection is based purely on density
+                return np.zeros(len(self.relevant_indices))
+        
+        if is_pytorch_model:
+            oldmode = model.training
+            model.eval()
 
         print(f'Start calculating points margin.')
         all_images_idx = self.relevant_indices
         images_loader = data_obj.getSequentialDataLoader(indexes=all_images_idx,
                                                 batch_size=self.cfg.TRAIN.BATCH_SIZE, data=train_data)
-        clf = model.cuda()
+        
+        if is_pytorch_model:
+            clf = model.cuda()
+        else:
+            clf = model
+            
         ranks = []
         n_loader = len(images_loader)
 
-        for i, (x_u, _) in enumerate(tqdm(images_loader, desc="All images Activations")):
-            with torch.no_grad():
-                x_u = x_u.cuda(0)
-                temp_u_rank = torch.nn.functional.softmax(clf(x_u), dim=1)
-                temp_u_rank, _ = torch.sort(temp_u_rank, descending=True)
-                difference = temp_u_rank[:, 0] - temp_u_rank[:, 1]
+        for i, (x_u, _, j) in enumerate(tqdm(images_loader, desc="All images Activations")):
+            if is_pytorch_model:
+                with torch.no_grad():
+                    x_u = x_u.cuda(0)
+                    temp_u_rank = torch.nn.functional.softmax(clf(x_u), dim=1)
+                    temp_u_rank, _ = torch.sort(temp_u_rank, descending=True)
+                    difference = temp_u_rank[:, 0] - temp_u_rank[:, 1]
 
+                    # for code consistency across uncertainty, entropy methods i.e., picking datapoints with max value
+                    difference = -1 * difference
+                    ranks.append(difference.detach().cpu().numpy())
+            else:
+                # sklearn MLPClassifier
+                x_u_np = x_u.cpu().numpy() if isinstance(x_u, torch.Tensor) else x_u
+                # Reshape if needed for sklearn
+                x_u_np = x_u_np.reshape(x_u_np.shape[0], -1)
+                temp_u_rank = clf.predict_proba(x_u_np)
+                temp_u_rank = np.sort(temp_u_rank, axis=1)[:, ::-1]
+                difference = temp_u_rank[:, 0] - temp_u_rank[:, 1]
+                
                 # for code consistency across uncertainty, entropy methods i.e., picking datapoints with max value
                 difference = -1 * difference
-                ranks.append(difference.detach().cpu().numpy())
+                ranks.append(difference)
+                
         ranks = np.concatenate(ranks, axis=0)
         print(f"u_ranks.shape: {ranks.shape}")
 
-        model.train(oldmode)
+        if is_pytorch_model:
+            model.train(oldmode)
 
         margin_result = np.array(ranks).reshape(-1, 1)
         scaler = MinMaxScaler()

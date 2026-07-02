@@ -2,7 +2,8 @@
 RNG_SEED: 1
 DATASET:
   NAME: TINYIMAGENET 
-  ROOT_DIR: 'data/tiny-imagenet-200/tiny-imagenet-200'
+#  ROOT_DIR: '/cs/labs/daphna/maorni_cse/emb_lab/emb_al/data/tiny-imagenet-200'
+  ROOT_DIR: '/cs/labs/daphna/itai.david/fixed_tiny_imagenet/tiny-imagenet-200/tiny-imagenet-200/'
   VAL_RATIO: 0.05
   AUG_METHOD: 'hflip'
 MODEL:

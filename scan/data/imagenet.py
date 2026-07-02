@@ -7,14 +7,15 @@ import torch
 import torchvision.datasets as datasets
 import torch.utils.data as data
 from PIL import Image
-from utils.mypath import MyPath
 from torchvision import transforms as tf
 from glob import glob
+
+from TypiClust.scan.utils.mypath import MyPath
 
 
 class ImageNet(datasets.ImageFolder):
     def __init__(self, root=MyPath.db_root_dir('imagenet'), split='train', transform=None):
-        super(ImageNet, self).__init__(root=os.path.join(root, 'ILSVRC2012_img_%s' %(split)),
+        super(ImageNet, self).__init__(root=os.path.join(root,(split)),
                                          transform=None)
         self.transform = transform 
         self.split = split

@@ -56,7 +56,7 @@ def average_first_derivative(kernel: np.ndarray) -> Tuple[np.ndarray, np.ndarray
 def plot_average_derivative(x: np.ndarray, y: np.ndarray, output_path: Path, show: bool) -> None:
     """Plot and optionally display the averaged first derivative."""
     plt.figure(figsize=(8, 4))
-    plt.plot(x[:-5:10], y[:-5:10], label="Average first derivative")
+    plt.plot(x, y, label="Average first derivative")
     plt.xlabel("Sorted index")
     plt.ylabel("Average first derivative")
     plt.title("Average first derivative of sorted kernel rows")

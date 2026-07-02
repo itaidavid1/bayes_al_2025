@@ -228,7 +228,28 @@ _C.DATASET.VAL_RATIO = 0.1
 # Data augmentation methods - 'simclr', 'randaug', 'hflip'
 _C.DATASET.AUG_METHOD = 'hflip' 
 # Accepted Datasets
-_C.DATASET.ACCEPTED = ['MNIST','SVHN','CIFAR10','CIFAR100','TINYIMAGENET', 'IMBALANCED_CIFAR10', 'IMBALANCED_CIFAR100', 'IMAGENET50', 'IMAGENET100', 'IMAGENET200', 'SCENARIO_A', 'HALF_MOON']
+_C.DATASET.ACCEPTED = ['MNIST','SVHN','CIFAR10','CIFAR100','TINYIMAGENET', 'IMBALANCED_CIFAR10', 'IMBALANCED_CIFAR100', 'IMAGENET50', 'IMAGENET100', 'IMAGENET100_byol','IMAGENET100_simclr','IMAGENET200', 'SCENARIO_A', 'HALF_MOON', 'CIFAR100_dino', 'CIFAR100_byol','CIFAR100_barlow', 'CIFAR10_byol']
+
+# ---------------------------------------------------------------------------- #
+# Federated learning options
+# ---------------------------------------------------------------------------- #
+_C.FEDERATED = CN()
+_C.FEDERATED.NUM_CLIENTS = 10
+_C.FEDERATED.NUM_ROUNDS = 10
+_C.FEDERATED.CLIENTS_PER_ROUND = 5
+_C.FEDERATED.LOCAL_EPOCHS = 1
+_C.FEDERATED.METHOD = "fedavg"
+_C.FEDERATED.PARTITION_MODE = "iid"
+_C.FEDERATED.DIRICHLET_ALPHA = 0.5
+_C.FEDERATED.MIN_CLIENT_SIZE = 10
+_C.FEDERATED.MODE = "standard"
+_C.FEDERATED.QUERIES_PER_ROUND = 1
+_C.FEDERATED.VERACITY_AGG = "confidence_mean"
+_C.FEDERATED.VERACITY_LOSS_WEIGHT = 1.0
+_C.FEDERATED.CLIENT_LABELS_INITIAL_SIZE = 10
+
+# FedProx-specific options
+_C.FEDPROX_MU = 0.01
 
 def assert_cfg():
     """Checks config values invariants."""

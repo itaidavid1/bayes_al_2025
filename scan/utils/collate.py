@@ -5,7 +5,9 @@ Licensed under the CC BY-NC 4.0 license (https://creativecommons.org/licenses/by
 import torch
 import numpy as np
 import collections
-from torch._six import string_classes
+
+# torch._six was removed in newer PyTorch; string_classes was (str, bytes).
+_string_classes = (str, bytes)
 
 
 """ Custom collate function """
@@ -25,7 +27,7 @@ def collate_custom(batch):
     elif isinstance(batch[0], float):
         return torch.FloatTensor(batch)
 
-    elif isinstance(batch[0], string_classes):
+    elif isinstance(batch[0], _string_classes):
         return batch
 
     elif isinstance(batch[0], collections.Mapping):

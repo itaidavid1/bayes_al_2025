@@ -2,15 +2,20 @@ import numpy as np
 import torch
 import copy
 import time
+
+from sympy import true
 from tqdm import tqdm
 import torch.nn.functional as F
 import pycls.datasets.utils as ds_utils
 from tools.utils import visualize_tsne
 
 # from pycls.utils.metrics import compute_coverage
-# from pycls.utils.io import compute_cand_size
 # from torch.utils.data import DataLoader
 
+def compute_cand_size(l, budget, max_size=35000):
+    ub = 45000 * (35000 + 10000)
+    cand_size = int((ub + (l + budget) ** 2 / 4) ** 0.5 - 1.5 * (l + budget))
+    return max(min(max_size, cand_size), budget)
 
 def compute_norm(x1, x2, device, batch_size=512):
     x1, x2 = x1.unsqueeze(0).to(device), x2.unsqueeze(0).to(device) # 1 x n x d, 1 x n' x d
@@ -102,7 +107,7 @@ class RationalQuadKernel(object):
 
 class MaxHerding:
     def __init__(self, cfg, lSet, uSet, budgetSize,
-                 delta=1, kernel="rbf", device="cuda", batch_size=1024):
+                 delta=1, kernel="rbf", device="cuda", batch_size=1024, permute=True):
         self.cfg = cfg
         self.ds_name = self.cfg['DATASET']['NAME']
         self.seed = self.cfg['RNG_SEED']
@@ -117,13 +122,12 @@ class MaxHerding:
         self.delta = delta
         print(f"MaxHerding | Using {kernel} kernel with sigma = {delta}")
 
-        # subset_size = compute_cand_size(len(self.lSet), self.budgetSize) # 35000 if self.ds_name not in ['IMAGENET', 'IMBALANCED_IMAGENET'] else 40000
-        subset_size = 35000 if self.ds_name not in ['IMAGENET', 'IMBALANCED_IMAGENET'] else 40000
-        # print(f'Subset size: {subset_size}')
-        # # if permute:
-        # self.uSet = np.random.permutation(self.total_uSet)[:subset_size]
-        # else:
-        self.uSet = self.total_uSet
+        subset_size = compute_cand_size(len(self.lSet), self.budgetSize) # 35000 if self.ds_name not in ['IMAGENET', 'IMBALANCED_IMAGENET'] else 40000
+        print(f'Subset size: {subset_size}')
+        if permute:
+            self.uSet = np.random.permutation(self.total_uSet)[:subset_size]
+        else:
+            self.uSet = self.total_uSet
 
         self.relevant_indices = np.concatenate([self.lSet, self.uSet]).astype(int)
         if isinstance(self.all_features, torch.Tensor):
@@ -134,7 +138,18 @@ class MaxHerding:
             raise NotImplementedError('Unknown type of features')
 
         self.kernel_fn = self.construct_kernel_fn(kernel_name=kernel)
-        self.activeSet = []
+
+        self.kernel_all = self.kernel_fn.compute_kernel(
+            self.relevant_features, self.relevant_features, self.delta,
+            batch_size=self.batch_size).to(self.device, dtype=torch.float16)  # (l+u) x (l+u)
+        print(f"Memory size of kernel: {self.kernel_all.element_size() * self.kernel_all.nelement()}")
+
+        if len(self.lSet) > 0:
+            self.kernel_la = self.kernel_fn.compute_kernel(
+                self.relevant_features[:len(self.lSet)], self.relevant_features, self.delta,
+                batch_size=self.batch_size).to(self.device)
+
+        torch.cuda.empty_cache()
 
 
     def construct_kernel_fn(self, kernel_name):
@@ -170,9 +185,8 @@ class MaxHerding:
 
 
     def select_samples(self):
-        # uncertainties = torch.ones(1, len(self.relevant_indices)).float().to(self.device)
-
-        self.init_sampling_loop()
+        uncertainties = torch.ones(1, len(self.relevant_indices)).float().to(self.device,dtype=torch.float16)
+        # self.init_sampling_loop()
 
         start_time = time.time()
         inner_lSet = torch.arange(len(self.lSet)).to(self.device)
@@ -182,32 +196,30 @@ class MaxHerding:
         inner_uSet = fixed_inner_uSet[inner_uSet_bool].to(self.device)
 
         if inner_lSet.shape[0] > 0:
-            max_embedding = self.kernel_la.max(dim=0, keepdim=True).values # 1 x N
+            max_embedding = self.kernel_la.max(dim=0, keepdim=True).values.to(dtype=torch.float16) # 1 x N
         else:
-            max_embedding = torch.zeros(1, len(inner_lSet) + len(fixed_inner_uSet)).cpu() # 1 x N
-            # max_embedding = torch.zeros(1, len(inner_lSet) + len(fixed_inner_uSet)).to(self.device) # 1 x N
+            max_embedding = torch.zeros(1, len(inner_lSet) + len(fixed_inner_uSet)).to(self.device, dtype=torch.float16) # 1 x N
 
         selected = []
         for i in tqdm(range(self.budgetSize), desc="MaxHerding | Selecting samples"):
             num_lSet = len(inner_lSet)
             num_uSet = len(inner_uSet)
 
-            updated_max_embedding = (self.kernel_all.cpu() - max_embedding.cpu()) # N x N
+            updated_max_embedding = (self.kernel_all - max_embedding) # N x N
             updated_max_embedding[updated_max_embedding < 0] = 0.
 
-            # mean_max_embedding = (uncertainties * updated_max_embedding).mean(dim=-1) # N
-            mean_max_embedding = updated_max_embedding.mean(dim=-1)  # N
+            mean_max_embedding = (uncertainties * updated_max_embedding).mean(dim=-1) # N
 
             # select a point from u
-            mean_max_embedding[inner_lSet.cpu()] = -np.inf
+            mean_max_embedding[inner_lSet] = -np.inf
             selected_index = torch.argmax(mean_max_embedding)
 
             # update lSet and uSet
-            inner_lSet = torch.cat((inner_lSet.cpu(), selected_index.view(-1)))
+            inner_lSet = torch.cat((inner_lSet, selected_index.view(-1)))
             inner_uSet_bool[selected_index - len(self.lSet)] = False
             inner_uSet = fixed_inner_uSet[inner_uSet_bool]
 
-            max_embedding = updated_max_embedding[selected_index].unsqueeze(0) + max_embedding.cpu()
+            max_embedding = updated_max_embedding[selected_index].unsqueeze(0) + max_embedding
 
             if len(set(inner_lSet.cpu().numpy())) != num_lSet + 1:
                 print(f'inner_lSet: {len(set(inner_lSet.numpy()))} is not equal to {num_lSet+1}')
@@ -221,10 +233,6 @@ class MaxHerding:
 
         selected = inner_lSet[len(self.lSet):].cpu()
 
-        # total_inner_lSet = torch.cat((torch.arange(len(self.lSet)), selected))
-        # total_lSet_features = self.relevant_features[total_inner_lSet].to(self.device)
-        # coverage = compute_coverage(total_lSet_features, self.relevant_features, self.kernel_fn)
-        # print(f'Mean coverage herding: {coverage}')
 
         assert len(selected) == self.budgetSize, 'added a different number of samples'
         activeSet = self.relevant_indices[selected].reshape(-1)

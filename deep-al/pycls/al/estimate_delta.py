@@ -131,7 +131,7 @@ def max_curvature_try_2(delta, purity):
 
 def main():
     parser = argparse.ArgumentParser(description="Script for processing dataset with a specific embedding type.")
-    parser.add_argument("--dataset", type=str, help="Name of the dataset to use.", default='CIFAR10')
+    parser.add_argument("--dataset", type=str, help="Name of the dataset to use.", default='TINYIMAGENET')
     # parser.add_argument("--embedding", type=str, required=True, help="Type of embedding to apply.", nargs='+')
     # parser.add_argument('--embeddings_action', default='list', type=str, choices=['list', 'avg', 'concat', 'pca'])
 

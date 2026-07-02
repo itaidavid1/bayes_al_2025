@@ -109,7 +109,8 @@ def get_model(p, pretrain_path=None):
             missing = model.load_state_dict(model_state, strict=True)
 
         else:
-            raise NotImplementedError
+            pass
+            # raise NotImplementedError
 
     elif pretrain_path is not None and not os.path.exists(pretrain_path):
         raise ValueError('Path with pre-trained weights does not exist {}'.format(pretrain_path))
@@ -206,7 +207,7 @@ def get_val_dataset(p, transform=None, to_neighbors_dataset=False):
 def get_train_dataloader(p, dataset):
     return torch.utils.data.DataLoader(dataset, num_workers=p['num_workers'], 
             batch_size=p['batch_size'], pin_memory=True, collate_fn=collate_custom,
-            drop_last=True, shuffle=True)
+            drop_last=False, shuffle=True)
 
 
 def get_val_dataloader(p, dataset):

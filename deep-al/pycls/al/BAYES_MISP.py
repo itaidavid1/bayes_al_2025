@@ -11,240 +11,9 @@ import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 from torch.profiler import profile, record_function, ProfilerActivity
 from . import prior_selection
+from .kernel_utils import build_sparse_kernel_matrix, RBFKernel, TopHatKernel, compute_norm
 ###MISP = maximum importance sampling points
 torch.cuda.empty_cache()
-
-def compute_norm(x1, x2, device, batch_size=512, matrices_type=torch.float16):
-    x1, x2 = x1.unsqueeze(0).to(device), x2.unsqueeze(0).to(device) # 1 x n x d, 1 x n' x d
-    dist_matrix = []
-    batch_round = x2.shape[1] // batch_size + int(x2.shape[1] % batch_size > 0)
-    for i in range(batch_round):
-        # distance comparisons are done in batches to reduce memory consumption
-        x2_subset = x2[:, i * batch_size: (i + 1) * batch_size]
-        dist = torch.cdist(x1, x2_subset).to(dtype=matrices_type)
-
-        dist_matrix.append(dist.cpu())
-        del dist
-
-    dist_matrix = torch.cat(dist_matrix, dim=-1).squeeze(0)
-    return dist_matrix
-
-def build_sparse_kernel_matrix(
-        features,
-        threshold,
-        *,
-        kernel_type,
-        kernel_param,
-        batch_size=1024,
-        device='cuda',
-        dtype=torch.float32,
-        zero_indices=None,
-        prev_threshold=None,
-        capture_zero_contrib=False,
-):
-    """
-    Build a symmetric sparse kernel matrix in CSR format without materializing the full dense matrix.
-
-    Args:
-        features (np.ndarray or torch.Tensor): Feature matrix of shape (N, D) on CPU.
-        threshold (float): Value used to sparsify the kernel. For 'rbf' this is the minimum kernel value kept.
-                           For 'tophat' this is interpreted as the distance cutoff (delta).
-        kernel_type (str): 'rbf' or 'tophat'.
-        kernel_param (float): Kernel-specific parameter. For 'rbf' this is sigma. For 'tophat' it is ignored.
-        batch_size (int): Number of rows processed per chunk.
-        device (str or torch.device): Device used for intermediate GPU computations.
-        dtype (torch.dtype): Dtype for intermediate tensors (float32 recommended for sparse path).
-        zero_indices (array-like, optional): Indices whose rows/cols should be zeroed in the returned matrix.
-        prev_threshold (float, optional): Previous threshold value. Required when
-            capture_zero_contrib=True to identify newly added connections.
-        capture_zero_contrib (bool): When True, returns the contributions that
-            originate from zeroed indices but were newly introduced by lowering
-            the sparsity threshold.
-
-    Returns:
-        scipy.sparse.csr_matrix: Symmetric sparse kernel matrix (N x N).
-        If capture_zero_contrib is True, returns a tuple containing the CSR
-        matrix and a dictionary with the newly discovered connections.
-    """
-    torch_device = torch.device(device)
-    if isinstance(features, torch.Tensor):
-        features_tensor = features.to(device=torch_device, dtype=torch.float32)
-    else:
-        features_tensor = torch.from_numpy(features).to(device=torch_device, dtype=torch.float32)
-
-    n_samples = features_tensor.shape[0]
-
-    row_blocks = []
-    col_blocks = []
-    data_blocks = []
-
-    thresh_val = threshold.item() if torch.is_tensor(threshold) else float(threshold)
-    prev_thresh_val = None
-    if prev_threshold is not None:
-        prev_thresh_val = prev_threshold.item() if torch.is_tensor(prev_threshold) else float(prev_threshold)
-
-    if kernel_type == 'rbf':
-        kernel_param_val = kernel_param.item() if torch.is_tensor(kernel_param) else float(kernel_param)
-
-    capture_zero_contrib = bool(capture_zero_contrib and prev_thresh_val is not None and
-                                zero_indices is not None and len(zero_indices) > 0)
-    zero_idx = None
-    zero_mask_np = None
-    removed_sources = []
-    removed_targets = []
-    removed_values = []
-    if zero_indices is not None and len(zero_indices) > 0:
-        zero_idx = np.asarray(zero_indices, dtype=np.int64)
-        if capture_zero_contrib:
-            zero_mask_np = np.zeros(n_samples, dtype=bool)
-            zero_mask_np[zero_idx] = True
-
-    with torch.no_grad():
-        for start_i in range(0, n_samples, batch_size):
-            end_i = min(start_i + batch_size, n_samples)
-            chunk_i = features_tensor[start_i:end_i].to(dtype=dtype, non_blocking=True)
-
-            for start_j in range(start_i, n_samples, batch_size):
-                end_j = min(start_j + batch_size, n_samples)
-                chunk_j = features_tensor[start_j:end_j].to(dtype=dtype, non_blocking=True)
-
-                dist_block = torch.cdist(chunk_i, chunk_j)
-
-                if kernel_type == 'tophat':
-                    kernel_block = (dist_block < thresh_val).to(dtype=dtype)
-                elif kernel_type == 'rbf':
-                    kernel_block = torch.exp(-1.0 * (dist_block / kernel_param_val) ** 2)
-                else:
-                    raise ValueError(f"Unsupported kernel type: {kernel_type}")
-
-                if kernel_type == 'rbf':
-                    mask = kernel_block > thresh_val
-                else:
-                    mask = kernel_block > 0
-
-                nz_rows, nz_cols = torch.nonzero(mask, as_tuple=True)
-                if nz_rows.numel() == 0:
-                    continue
-
-                values = kernel_block[nz_rows, nz_cols]
-
-                rows_cpu = (nz_rows + start_i).cpu().numpy()
-                cols_cpu = (nz_cols + start_j).cpu().numpy()
-                data_cpu = values.cpu().numpy().astype(np.float32, copy=False)
-
-                row_blocks.append(rows_cpu)
-                col_blocks.append(cols_cpu)
-                data_blocks.append(data_cpu)
-
-                if start_j != start_i:
-                    row_blocks.append(cols_cpu)
-                    col_blocks.append(rows_cpu)
-                    data_blocks.append(data_cpu.copy())
-
-                if not capture_zero_contrib:
-                    continue
-
-                if kernel_type == 'rbf':
-                    prev_keep_mask = kernel_block > prev_thresh_val
-                else:
-                    prev_keep_mask = dist_block < prev_thresh_val
-
-                new_entries_mask = mask & (~prev_keep_mask)
-                new_rows, new_cols = torch.nonzero(new_entries_mask, as_tuple=True)
-                if new_rows.numel() == 0:
-                    continue
-
-                contrib_rows = (new_rows + start_i).cpu().numpy()
-                contrib_cols = (new_cols + start_j).cpu().numpy()
-                contrib_vals = kernel_block[new_rows, new_cols].cpu().numpy().astype(np.float32, copy=False)
-
-                zero_rows_mask = zero_mask_np[contrib_rows]
-                zero_cols_mask = zero_mask_np[contrib_cols]
-
-                if zero_rows_mask.any():
-                    non_zero_cols = ~zero_mask_np[contrib_cols]
-                    row_mask = zero_rows_mask & non_zero_cols
-                    if row_mask.any():
-                        removed_sources.append(contrib_rows[row_mask])
-                        removed_targets.append(contrib_cols[row_mask])
-                        removed_values.append(contrib_vals[row_mask])
-
-                if zero_cols_mask.any():
-                    non_zero_rows = ~zero_mask_np[contrib_rows]
-                    col_mask = zero_cols_mask & non_zero_rows
-                    if col_mask.any():
-                        removed_sources.append(contrib_cols[col_mask])
-                        removed_targets.append(contrib_rows[col_mask])
-                        removed_values.append(contrib_vals[col_mask])
-
-    if not row_blocks:
-        csr = sp.csr_matrix((n_samples, n_samples), dtype=np.float32)
-    else:
-        rows = np.concatenate(row_blocks)
-        cols = np.concatenate(col_blocks)
-        data = np.concatenate(data_blocks)
-        coo = sp.coo_matrix((data, (rows, cols)), shape=(n_samples, n_samples))
-        csr = coo.tocsr()
-
-    if zero_idx is not None and zero_idx.size > 0:
-        csr[zero_idx, :] = 0
-        csr[:, zero_idx] = 0
-
-    if not capture_zero_contrib:
-        return csr
-
-    if removed_sources:
-        zero_contrib = {
-            "sources": np.concatenate(removed_sources).astype(np.int64, copy=False),
-            "targets": np.concatenate(removed_targets).astype(np.int64, copy=False),
-            "values": np.concatenate(removed_values).astype(np.float32, copy=False),
-        }
-    else:
-        zero_contrib = {
-            "sources": np.empty((0,), dtype=np.int64),
-            "targets": np.empty((0,), dtype=np.int64),
-            "values": np.empty((0,), dtype=np.float32),
-        }
-
-    return csr, zero_contrib
-
-
-class RBFKernel(object):
-    def __init__(self, device):
-        self.device = device
-
-    def compute_kernel(self, x1, x2, h=1.0, batch_size=512, matrices_type=torch.float16):
-        norm = compute_norm(x1, x2, self.device, batch_size=batch_size, matrices_type=matrices_type)
-        k = torch.exp(-1.0 * (norm / h) ** 2)
-        return k
-
-    def compute_kernel_from_norm(self, norm_matrix, h, matrices_type=torch.float16):
-        k = torch.exp(-1.0 * (norm_matrix / h) ** 2).to(dtype=matrices_type)
-        return k
-
-
-class TopHatKernel(object):
-    def __init__(self, device):
-        self.device = device
-
-    def compute_kernel(self, x1, x2, h, batch_size=512, matrices_type=torch.float16):
-        x1, x2 = x1.unsqueeze(0).to(self.device), x2.unsqueeze(0).to(self.device) # 1 x n x d, 1 x n' x d
-        dist_matrix = []
-        batch_round = x2.shape[1] // batch_size + int(x2.shape[1] % batch_size > 0)
-        for i in range(batch_round):
-            # distance comparisons are done in batches to reduce memory consumption
-            x2_subset = x2[:, i * batch_size: (i + 1) * batch_size]
-            dist = torch.cdist(x1, x2_subset)
-            dist = (dist < h).to(dtype=matrices_type)
-            dist_matrix.append(dist.cpu())
-            del dist
-        dist_matrix = torch.cat(dist_matrix, dim=-1).squeeze(0)
-        # k = (dist_matrix < h).to(dtype=torch.float16)
-        return dist_matrix
-
-    def compute_kernel_from_norm(self, norm_matrix, h, matrices_type=torch.float16):
-        k = (norm_matrix < h).to(dtype=matrices_type)
-        return k
 
 
 class BAYES_MISP:
@@ -254,18 +23,28 @@ class BAYES_MISP:
         self.seed = self.cfg['RNG_SEED']
         self.all_features = ds_utils.load_features(self.ds_name, train=True, )
         self.diff_method = self.cfg.DIFF_METHOD if 'DIFF_METHOD' in self.cfg else 'abs_diff'
+        self.alpha_init_mode = self.cfg.ALPHA_INIT_MODE if 'ALPHA_INIT_MODE' in self.cfg else 'constant'
+        self.alpha_vector_path = self.cfg.ALPHA_VECTOR_PATH if 'ALPHA_VECTOR_PATH' in self.cfg else ''
         self.alpha = self.cfg.ALPHA if self.diff_method not in ['prob_cover', 'max_herding'] else 0
         self.debug = self.cfg.DEBUG
         self.use_sparse = self.cfg.SPARSE_K
         self.matrices_type = torch.float32 if self.use_sparse else torch.float16
         self.cont_method = self.cfg.CONT_METHOD if 'CONT_METHOD' in self.cfg else 'positive'
         self.distribution_cont_weight_method = self.cfg.DISTRIBUTION_CONT_WEIGHT_METHOD if 'DISTRIBUTION_CONT_WEIGHT_METHOD' in self.cfg else 'weighted'
+        self.c_normalization = self.cfg.C_NORMALIZATION if 'C_NORMALIZATION' in self.cfg else 'sum'
         self.budgetSize = budgetSize
         self.K_sparsity_threshold = self.cfg.K_SPARSITY_THRESHOLD
         self.sigma = cfg.ACTIVE_LEARNING.INITIAL_SIGMA if 'INITIAL_SIGMA' in cfg.ACTIVE_LEARNING else 1.0
         self.update_K_matrix = self.cfg.UPDATE_K_MATRIX if 'UPDATE_K_MATRIX' in self.cfg else False
         self.class_weighting_method = self.cfg.CLASS_WEIGHTING_METHOD if 'CLASS_WEIGHTING_METHOD' in self.cfg else 'none'
+        self.switch_alpha_low_to_high = cfg.SWITCH_ALPHA_LOW_TO_HIGH
+        self.switch_alpha_high_to_low = cfg.SWITCH_ALPHA_HIGH_TO_LOW
+        self.switch_alpha_alltime = cfg.SWITCH_ALPHA_ALLTIME
 
+        if self.switch_alpha_low_to_high or self.switch_alpha_alltime:
+            self.alpha = 0.01
+        if self.switch_alpha_high_to_low:
+            self.alpha = 50
 
         self.delta = delta
 
@@ -283,6 +62,10 @@ class BAYES_MISP:
         self.cum_labels_info = torch.zeros(self.num_of_classes).to('cuda')
         self.labeled_points_mask_general = torch.zeros(self.all_features.shape[0], dtype=torch.bool).to('cuda')
 
+        self.alpha_decay_gamma = self.cfg.ALPHA_DECAY_GAMMA if 'ALPHA_DECAY_GAMMA' in self.cfg else 0.0
+        self.alpha_base = None  # set after alpha is finalized (after alpha_init_mode logic)
+
+        self.calc_method = self.cfg.CALC_METHOD if 'CALC_METHOD' in self.cfg else 'max'
         self.kernel_type = self.cfg.KERNEL_TYPE if 'KERNEL_TYPE' in self.cfg else 'rbf'
         if self.kernel_type == 'tophat':
             self.kernel_fn = TopHatKernel('cuda')
@@ -299,8 +82,25 @@ class BAYES_MISP:
 
         self.total_connections_chosen = 0
 
+        if self.alpha_init_mode == 'from_sparsity':
+            sparsity_val = self.delta if self.kernel_type == 'tophat' else self.K_sparsity_threshold
+            self.alpha = float(sparsity_val) / self.num_of_classes
+            print(f"[alpha_init_mode=from_sparsity] alpha = {sparsity_val} / {self.num_of_classes} = {self.alpha}")
+        elif self.alpha_init_mode == 'from_vector':
+            k_sorted_vector = np.load(self.alpha_vector_path)
+            self.alpha_per_point = k_sorted_vector / self.num_of_classes
+            self.alpha = float(np.mean(self.alpha_per_point))
+            print(f"[alpha_init_mode=from_vector] loaded vector from {self.alpha_vector_path}, "
+                  f"shape={k_sorted_vector.shape}, alpha_per_point range=[{self.alpha_per_point.min():.4f}, {self.alpha_per_point.max():.4f}], mean={self.alpha:.4f}")
+
+        self.alpha_base = self.alpha
+        self._init_alpha_decay()
+
         if cfg.LOCAL_ALPHA:
             self.init_C(lset, self.K_general, cfg.LOCAL_ALPHA_ORACLE_METHOD)
+        elif self.alpha_init_mode == 'from_vector':
+            alpha_tensor = torch.from_numpy(self.alpha_per_point.astype(np.float32)).to(device='cuda', dtype=self.matrices_type)
+            self.C_general = alpha_tensor.unsqueeze(1).expand(-1, unique_labels.size).contiguous()
         else:
             self.C_general = torch.full((self.all_features.shape[0], unique_labels.size), self.alpha, device='cuda',
                                         dtype=self.matrices_type)
@@ -332,6 +132,43 @@ class BAYES_MISP:
                 del curr_labels_sim
             del temp_K, class_indices
         torch.cuda.empty_cache()
+
+    def _init_alpha_decay(self):
+        """Initialize per-class decay factors beta_m and effective alpha vector."""
+        if self.alpha_decay_gamma > 0:
+            self.beta_per_class = torch.ones(self.num_of_classes, device='cuda')
+            self.effective_alpha_per_class = torch.full((self.num_of_classes,), self.alpha_base, device='cuda')
+            print(f"[alpha_decay] gamma={self.alpha_decay_gamma}, alpha_base={self.alpha_base}")
+        else:
+            self.beta_per_class = None
+            self.effective_alpha_per_class = None
+
+    def _compute_beta(self, class_idx):
+        """Compute beta_m = 1 / (1 + gamma * I_m) for class m."""
+        return 1.0 / (1.0 + self.alpha_decay_gamma * self.cum_labels_info[class_idx])
+
+    def _update_alpha_decay(self, class_idx, unlabeled_mask):
+        """
+        Recompute beta and effective alpha for a class after its I_m changed.
+        Adjusts C matrix for all unlabeled points to reflect the new effective alpha.
+
+        Returns the delta (new_effective - old_effective) that was applied.
+        """
+        if self.beta_per_class is None:
+            return 0.0
+
+        old_effective = self.effective_alpha_per_class[class_idx].clone()
+        new_beta = self._compute_beta(class_idx)
+        new_effective = self.alpha_base * new_beta
+
+        self.beta_per_class[class_idx] = new_beta
+        self.effective_alpha_per_class[class_idx] = new_effective
+
+        delta = new_effective - old_effective
+        if delta != 0:
+            self.C[unlabeled_mask, class_idx] += delta
+
+        return delta.item()
 
     def build_K_general_matrix(self, features, threshold, zero_indices=None, prev_threshold=None):
         thresh_val = threshold.item() if isinstance(threshold, torch.Tensor) else float(threshold)
@@ -526,8 +363,30 @@ class BAYES_MISP:
         torch.cuda.empty_cache()
 
 
+    def _sync_alpha_decay_to_C_general(self):
+        """
+        Synchronize C_general with current effective alpha per class.
+        Called at the start of each selection round to account for any
+        cum_labels_info changes that happened between rounds (e.g. from
+        K matrix rebuilding).
+        """
+        if self.beta_per_class is None:
+            return
+
+        unlabeled = ~self.labeled_points_mask_general
+        for m in range(self.num_of_classes):
+            new_beta = self._compute_beta(m)
+            new_effective = self.alpha_base * new_beta
+            old_effective = self.effective_alpha_per_class[m]
+            delta = new_effective - old_effective
+            if delta != 0:
+                self.C_general[unlabeled, m] += delta
+            self.beta_per_class[m] = new_beta
+            self.effective_alpha_per_class[m] = new_effective
+
     def init_sampling_loop(self,lset, uset):
         torch.cuda.empty_cache()
+        # self._sync_alpha_decay_to_C_general()
         self.set_rel_features(lset, uset)
         self.activeSet = []
         if self.use_sparse:
@@ -547,6 +406,24 @@ class BAYES_MISP:
             del K_csr_shuffled, values, col_indices, crow_indices
         else:
             self.K =  self.K_general[self.relevant_indices, :][:, self.relevant_indices]
+
+
+
+        is_iteration_5 = len(lset) == self.C_general.shape[1] * 5
+        if self.switch_alpha_low_to_high and is_iteration_5:
+            self.C_general[uset] += (50 - self.alpha)
+            self.alpha = 50
+        if self.switch_alpha_high_to_low and is_iteration_5:
+            self.C_general[uset] += (0.01 - self.alpha)
+            self.alpha = 0.01
+        if self.switch_alpha_alltime and len(lset) > 0:
+            if self.alpha == 50:
+                self.alpha = 0.01
+                self.C_general[uset] -= (50 - self.alpha)
+            else: #self.alpha == 0.01
+                self.alpha = 50
+                self.C_general[uset] -= (0.01 - self.alpha)
+
         self.C = self.C_general[self.relevant_indices].to('cuda')
         self.train_labels = self.train_labels_general[self.relevant_indices]
         self.labeled_points_mask = self.labeled_points_mask_general[self.relevant_indices]
@@ -577,6 +454,17 @@ class BAYES_MISP:
 
         self.init_sampling_loop(lset, uset)
 
+        # Apply NN-C matrix fusion if enabled
+        # self.C remains the clean kernel-based matrix
+        # self.C_fused (if created) is used for selection decisions
+        self.C_fused = None
+        if hasattr(self, 'nn_fusion_enabled') and self.nn_fusion_enabled:
+            self._apply_nn_fusion(uset)
+
+        # Determine which C matrix to use for selection
+        # Use C_fused if available, otherwise use clean C
+        use_fused = self.C_fused is not None
+
         # lset = np.array([12763, 48804, 36863, 40453, 46313, 44436, 15302, 48657, 34025, 44459])
         #
         # for i, l in enumerate(lset):
@@ -586,19 +474,28 @@ class BAYES_MISP:
         # invalid_mask = np.isin(uset, lset)
         # uset = uset[~invalid_mask]
         print(f'Start selecting {self.budgetSize} samples.')
+        if use_fused:
+            print("Using fused C matrix (kernel + NN) for selection decisions.")
         selected = []
         for i in range(self.budgetSize):
             curr_l_set = np.concatenate((np.arange(len(self.lSet)), selected)).astype(int)
 
             class_gains_weights = self.get_class_gains_weighting_vector()
 
-            if self.use_sparse:
-                point_total_contribution = batched_diffs_efficient_weighted_sparse(self.K, self.C, cont_method=self.cont_method, weight_method=self.weight_method, class_gains_weights=class_gains_weights)
+            # Use C_fused for selection decisions if available
+            C_for_selection = self.C_fused if use_fused else self.C
+            if self.diff_method == 'max':
+                C_sum = torch.sum(self.C, dim=1, keepdim=True)
+                norm_C = self.C / C_sum
+                max_vals, indices = torch.max(norm_C, dim=1)
+                point_total_contribution = batched_diffs_sparse_max(self.K, max_vals, self.alpha, self.num_of_classes)
+            elif self.use_sparse:
+                point_total_contribution = batched_diffs_efficient_weighted_sparse(self.K, C_for_selection, cont_method=self.cont_method, weight_method=self.distribution_cont_weight_method, class_gains_weights=class_gains_weights, c_normalization=self.c_normalization, calc_method=self.calc_method)
             else:
                 if len(self.K.shape) == 2:
                     self.K.unsqueeze_(2)
-                point_total_contribution = batched_diffs_efficient_weighted(self.K, self.C,
-                                                      diff_method="efficient_full_weighted_max",cont_method=self.cont_method, weight_method=self.weight_method)
+                point_total_contribution = batched_diffs_efficient_weighted(self.K, C_for_selection,
+                                                      diff_method="efficient_full_weighted_max",cont_method=self.cont_method, weight_method=self.distribution_cont_weight_method, c_normalization=self.c_normalization)
 
             point_total_contribution[curr_l_set] = -np.inf
 
@@ -609,14 +506,24 @@ class BAYES_MISP:
 
             K_row_dense = self.K[sampled_point].to_dense().to('cuda').squeeze()
 
-
+            # Update the clean C matrix (kernel-based only)
             self.labeled_points_mask[sampled_point] = True
             self.C[sampled_point, :] = torch.zeros(self.num_of_classes).to('cuda')
             self.C[sampled_point, chosen_label] = 1.0
-
             self.C[~self.labeled_points_mask, chosen_label] += K_row_dense[~self.labeled_points_mask]
+
+            # Also update C_fused if it exists (to keep selection decisions consistent)
+            if use_fused:
+                self.C_fused[sampled_point, :] = torch.zeros(self.num_of_classes).to('cuda')
+                self.C_fused[sampled_point, chosen_label] = 1.0
+                self.C_fused[~self.labeled_points_mask, chosen_label] += K_row_dense[~self.labeled_points_mask]
+
             self.cum_labels_info[chosen_label] += K_row_dense.sum()
             self.total_connections_chosen += torch.sum(K_row_dense > 0).item()
+
+            alpha_delta = self._update_alpha_decay(chosen_label, ~self.labeled_points_mask)
+            if use_fused and alpha_delta != 0:
+                self.C_fused[~self.labeled_points_mask, chosen_label] += alpha_delta
 
             assert sampled_point not in selected, 'sample was already selected'
             selected.append(sampled_point)
@@ -625,6 +532,7 @@ class BAYES_MISP:
         assert len(selected) == self.budgetSize, 'added a different number of samples'
         activeSet = self.relevant_indices[selected]
 
+        # Save the clean C matrix (without NN fusion) to C_general for future rounds
         self.C_general[self.relevant_indices] = self.C
         self.labeled_points_mask_general[self.relevant_indices] = self.labeled_points_mask
         remainSet = np.array(sorted(list(set(self.uSet) - set(activeSet))))
@@ -634,6 +542,9 @@ class BAYES_MISP:
 
         del self.K
         del self.C
+        if self.C_fused is not None:
+            del self.C_fused
+            self.C_fused = None
 
         return activeSet, remainSet
 
@@ -683,34 +594,224 @@ class BAYES_MISP:
             prev_threshold=old_threshold
         )
 
+    def set_nn_fusion_params(self, clf_model, data_obj, train_data, per_class_accuracy):
+        """
+        Set parameters for NN-C matrix fusion mode.
+        
+        Args:
+            clf_model: Trained classifier model
+            data_obj: Data object for creating data loaders
+            train_data: Training dataset
+            per_class_accuracy: Per-class accuracy vector of shape (num_classes,), values in [0, 1]
+        """
+        self.nn_fusion_model = clf_model
+        self.nn_fusion_data_obj = data_obj
+        self.nn_fusion_train_data = train_data
+        self.nn_fusion_per_class_accuracy = torch.from_numpy(per_class_accuracy).to(
+            device='cuda', dtype=self.matrices_type
+        )
+        self.nn_fusion_enabled = True
+        print(f"NN fusion enabled with per-class accuracy: {per_class_accuracy}")
+
+    @torch.no_grad()
+    def _compute_nn_C_matrix(self, uset_indices):
+        """
+        Compute NN-based pseudo-C matrix from model softmax predictions on unlabeled set.
+        
+        Args:
+            uset_indices: Indices of unlabeled samples in the original dataset
+            
+        Returns:
+            torch.Tensor: NN-based C matrix of shape (len(uset_indices), num_classes)
+        """
+        if not hasattr(self, 'nn_fusion_enabled') or not self.nn_fusion_enabled:
+            return None
+        
+        model = self.nn_fusion_model
+        data_obj = self.nn_fusion_data_obj
+        train_data = self.nn_fusion_train_data
+        
+        if model is None or data_obj is None or train_data is None:
+            return None
+        
+        # Create data loader for unlabeled set
+        uset_loader = data_obj.getSequentialDataLoader(
+            indexes=uset_indices, 
+            batch_size=self.cfg.TRAIN.BATCH_SIZE, 
+            data=train_data
+        )
+        
+        if torch.cuda.is_available():
+            model.cuda()
+        model.eval()
+        
+        all_softmax_preds = []
+        for batch in uset_loader:
+            if len(batch) == 3:
+                inputs, _, _ = batch
+            else:
+                inputs, _ = batch
+            
+            inputs = inputs.cuda().type(torch.cuda.FloatTensor)
+            logits = model(inputs)
+            softmax_preds = torch.softmax(logits, dim=1)
+            all_softmax_preds.append(softmax_preds)
+        
+        # Concatenate all predictions: shape (len(uset_indices), num_classes)
+        nn_C_matrix = torch.cat(all_softmax_preds, dim=0).to(dtype=self.matrices_type)
+        
+        return nn_C_matrix
+
+    def _scale_nn_matrix(self, nn_C_matrix, C_matrix_subset):
+        """
+        Scale NN predictions to match the magnitude of C matrix values.
+        
+        For each point i:
+            info_gained[i] = sum(C[i, :]) - alpha * num_classes
+            scaled_nn[i, :] = nn_C[i, :] * info_gained[i]
+        
+        Args:
+            nn_C_matrix: NN-based C matrix of shape (N_unlabeled, num_classes)
+            C_matrix_subset: Kernel-based C matrix subset for unlabeled points, shape (N_unlabeled, num_classes)
+            
+        Returns:
+            torch.Tensor: Scaled NN matrix of same shape
+        """
+        # Compute information gained per point (sum of C values minus initial alpha contribution)
+        sum_C = torch.sum(C_matrix_subset, dim=1, keepdim=True)  # (N, 1)
+        initial_alpha_sum = self.alpha * self.num_of_classes
+        info_gained = sum_C - initial_alpha_sum  # (N, 1)
+        
+        # Clamp to non-negative values (in case some points have less info than initial)
+        info_gained = torch.clamp(info_gained, min=0)
+        
+        # Scale NN predictions by the information gained
+        scaled_nn_matrix = nn_C_matrix * info_gained  # (N, num_classes)
+        
+        return scaled_nn_matrix
+
+    def _fuse_C_matrices(self, C_matrix, scaled_nn_matrix, unlabeled_mask):
+        """
+        Fuse kernel-based C matrix with scaled NN matrix using per-class accuracy as weights.
+        
+        For each class c:
+            C_fused[:, c] = C[:, c] + accuracy[c] * scaled_nn_matrix[:, c]
+        
+        Args:
+            C_matrix: Kernel-based C matrix of shape (N_total, num_classes)
+            scaled_nn_matrix: Scaled NN matrix for unlabeled points, shape (N_unlabeled, num_classes)
+            unlabeled_mask: Boolean mask indicating unlabeled points in C_matrix
+            
+        Returns:
+            torch.Tensor: Fused C matrix of shape (N_total, num_classes)
+        """
+        if not hasattr(self, 'nn_fusion_per_class_accuracy'):
+            return C_matrix
+        
+        accuracy_weights = self.nn_fusion_per_class_accuracy  # (num_classes,)
+        
+        # Create a copy to avoid modifying the original
+        C_fused = C_matrix.clone()
+        
+        # Apply weighted fusion only to unlabeled points
+        # For each class, add accuracy[c] * scaled_nn[c] to C[c]
+        weighted_nn = scaled_nn_matrix * accuracy_weights.unsqueeze(0)  # (N_unlabeled, num_classes)
+        C_fused[unlabeled_mask] = C_fused[unlabeled_mask] + weighted_nn
+        
+        return C_fused
+
+    def _apply_nn_fusion(self, uset):
+        """
+        Apply NN-C matrix fusion to create a fused C matrix for selection.
+        
+        This method orchestrates the full fusion pipeline:
+        1. Compute NN-based C matrix from model predictions
+        2. Scale NN predictions to match C matrix magnitude
+        3. Fuse the matrices using per-class accuracy weights
+        
+        The original self.C (kernel-based) is preserved, and a new self.C_fused
+        is created for use in sample selection. This allows future fusions to
+        always start from the clean kernel-based C matrix.
+        
+        Args:
+            uset: Unlabeled set indices
+        """
+        print("======== APPLYING NN-C MATRIX FUSION ========")
+        
+        # Compute NN-based C matrix for unlabeled set
+        nn_C_matrix = self._compute_nn_C_matrix(uset)
+        if nn_C_matrix is None:
+            print("NN fusion skipped: could not compute NN C matrix")
+            self.C_fused = None  # Use original C matrix
+            return
+        
+        # Get the unlabeled portion of the current (clean) C matrix
+        # self.C is indexed by relevant_indices which is [lset, uset]
+        # The unlabeled mask corresponds to indices after len(lSet)
+        unlabeled_local_mask = ~self.labeled_points_mask
+        C_unlabeled = self.C[unlabeled_local_mask]
+        
+        # Scale NN predictions to match C matrix magnitude
+        scaled_nn_matrix = self._scale_nn_matrix(nn_C_matrix, C_unlabeled)
+        
+        # Create fused matrix (self.C remains the clean kernel-based matrix)
+        self.C_fused = self._fuse_C_matrices(self.C, scaled_nn_matrix, unlabeled_local_mask)
+        
+        print(f"NN fusion applied. Scaled NN matrix stats: min={scaled_nn_matrix.min():.4f}, "
+              f"max={scaled_nn_matrix.max():.4f}, mean={scaled_nn_matrix.mean():.4f}")
+        print(f"C_fused created. Original C preserved for future fusions.")
+        
+        # Reset fusion state after use (to avoid reusing stale data)
+        self.nn_fusion_enabled = False
+
 
 # @torch.compile(backend="inductor")
-def batched_diffs_efficient_weighted(K: torch.Tensor, C: torch.Tensor, chunk_size: int = 1024, diff_method: str = "abs_diff", cont_method: str = "positive", weight_method: str = "weighted"):
+def batched_diffs_efficient_weighted(K: torch.Tensor, C: torch.Tensor, chunk_size: int = 1024, diff_method: str = "abs_diff", cont_method: str = "positive", weight_method: str = "weighted", c_normalization: str = "sum"):
     D, N, _ = K.shape
     result = torch.empty((D, )).to(device=C.device)
     max_C, _ = torch.max(C, dim=1, keepdim=True)
     sum_C = torch.sum(C, dim=1, keepdim=True)
-    norm_C = (C / sum_C)
-    old_max = (max_C / sum_C)
+    if c_normalization == 'softmax':
+        norm_C = torch.softmax(C, dim=1)
+    else:
+        norm_C = (C / sum_C)
+    old_max = norm_C.max(dim=1, keepdim=True).values
     C_diff = (C - max_C).unsqueeze(0)
     num_iterations = int(N)
     cont_method = cont_method
     max_C.unsqueeze_(0)
+    use_softmax_norm = (c_normalization == 'softmax')
+    if use_softmax_norm:
+        exp_C = torch.exp(C - C.max(dim=1, keepdim=True).values)  # numerically stable exp (N, classes)
+        Z_old = exp_C.sum(dim=1, keepdim=True)  # (N, 1)
+        exp_C_max = exp_C.max(dim=1, keepdim=True).values  # (N, 1) — exp of the max class
     for i in range(0, num_iterations, int(chunk_size)):
         end = min(i + chunk_size, D)
         K_batched = K[i:end]
         K_batched = K_batched.to('cuda')
         weights_batched = norm_C[i:end]
 
+        if use_softmax_norm:
+            # For each class c, adding K[i,j] to C[j,c]:
+            # Z_new[j,c] = Z_old[j] + exp_C[j,c] * (exp(K[i,j]) - 1)
+            # new_max_softmax[j,c] = max(exp_C_max[j], exp_C[j,c]*exp(K[i,j])) / Z_new[j,c]
+            exp_K = torch.exp(K_batched)  # (batch, N, 1)
+            # exp_C[j,c] * (exp(K) - 1) for each class c
+            Z_new = Z_old + exp_C.unsqueeze(0) * (exp_K - 1)  # (batch, N, classes)
+            # numerator: max(exp_C_max, exp_C[c]*exp(K)) per class c
+            boosted_exp = exp_C.unsqueeze(0) * exp_K  # (batch, N, classes) — exp(C[c]+K)
+            new_max_num = torch.maximum(exp_C_max.unsqueeze(0).expand_as(boosted_exp), boosted_exp)
+            new_state_vec = (new_max_num / Z_new) - old_max
+            del exp_K, Z_new, boosted_exp, new_max_num
+        else:
+            future_sum = K_batched + sum_C
+            state_add = max_C + K_batched
 
-        future_sum = K_batched + sum_C
-        state_add = max_C + K_batched
+            new_state_vec = torch.maximum(-K_batched, C_diff)
 
-        new_state_vec = torch.maximum(-K_batched, C_diff)
-
-        new_state_vec.add_(state_add)
-        new_state_vec.div_(future_sum)
-        new_state_vec.sub_(old_max)
+            new_state_vec.add_(state_add)
+            new_state_vec.div_(future_sum)
+            new_state_vec.sub_(old_max)
 
         if cont_method == "positive": ### regular method
             new_state_vec.clamp_(min=0)
@@ -752,7 +853,7 @@ def batched_diffs_efficient_weighted(K: torch.Tensor, C: torch.Tensor, chunk_siz
 
 
 # @torch.compile(backend="inductor")
-def batched_diffs_efficient_weighted_sparse(K_csr: torch.Tensor, C: torch.Tensor, chunk_size: int = 2048, cont_method: str = "positive", weight_method: str = "weighted", class_gains_weights: torch.Tensor = None):
+def batched_diffs_efficient_weighted_sparse(K_csr: torch.Tensor, C: torch.Tensor, chunk_size: int = 2048, cont_method: str = "positive", weight_method: str = "weighted", class_gains_weights: torch.Tensor = None, c_normalization: str = "sum", calc_method: str = "max"):
     D, N = K_csr.shape
     dev = C.device
     crow = K_csr.crow_indices().to(dev)  # shape (D+1,)
@@ -762,25 +863,59 @@ def batched_diffs_efficient_weighted_sparse(K_csr: torch.Tensor, C: torch.Tensor
     classes = C.shape[1]
     uniform_default_val = 1.0 / classes
 
-
+    use_softmax_norm = (c_normalization == 'softmax')
 
     result = torch.empty((D, )).to(device=C.device)
     max_C, _ = torch.max(C, dim=1, keepdim=True)
     sum_C = torch.sum(C, dim=1, keepdim=True)
-    has_mass = (sum_C != 0)
-    safe_sum = torch.where(has_mass, sum_C, torch.ones_like(sum_C))
-    norm_C = torch.where(has_mass, C / safe_sum, torch.full_like(C, uniform_default_val))
-    old_max = torch.where(has_mass, max_C / safe_sum, torch.zeros_like(max_C))
 
-    # norm_C = (C / sum_C)
-    # old_max = (max_C / sum_C)
+    if use_softmax_norm:
+        norm_C = torch.softmax(C, dim=1)
+        old_max = norm_C.max(dim=1, keepdim=True).values
+        C_stable = C - C.max(dim=1, keepdim=True).values  # for numerical stability
+        exp_C = torch.exp(C_stable)  # (N, classes)
+        Z_old = exp_C.sum(dim=1, keepdim=True)  # (N, 1)
+        exp_C_max = exp_C.max(dim=1, keepdim=True).values  # (N, 1)
+        exp_C = exp_C.squeeze()
+        Z_old = Z_old.squeeze()
+        exp_C_max = exp_C_max.squeeze()
+    else:
+        has_mass = (sum_C != 0)
+        safe_sum = torch.where(has_mass, sum_C, torch.ones_like(sum_C))
+        norm_C = torch.where(has_mass, C / safe_sum, torch.full_like(C, uniform_default_val))
+        old_max = torch.where(has_mass, max_C / safe_sum, torch.zeros_like(max_C))
 
     C_diff = (C - max_C)
     max_C = max_C.squeeze()
     sum_C = sum_C.squeeze()
     C_diff = C_diff.squeeze()
     old_max = old_max.squeeze()
-    num_iterations = int(N)
+
+
+    if calc_method == "entropy":
+        p_log2_p = norm_C * torch.log2(norm_C)
+        h_before_global = -torch.sum(p_log2_p, dim=1) # (N,)
+        h_before_global = torch.where(has_mass.squeeze(), h_before_global, torch.zeros_like(h_before_global))
+
+    elif calc_method == "margin":
+        top2 = torch.topk(C, 2, dim=1)
+        max1_val_global = top2.values[:, 0]
+        max2_val_global = top2.values[:, 1]
+        max1_idx_global = top2.indices[:, 0]
+        max2_idx_global = top2.indices[:, 1]
+
+        m_before_global = (max1_val_global - max2_val_global) / safe_sum.squeeze()
+        m_before_global = torch.where(has_mass.squeeze(), m_before_global, torch.zeros_like(m_before_global))
+
+    elif calc_method == "margin_not_normalized":
+        top2 = torch.topk(C, 2, dim=1)
+        max1_val_global = top2.values[:, 0]
+        max2_val_global = top2.values[:, 1]
+        max1_idx_global = top2.indices[:, 0]
+        max2_idx_global = top2.indices[:, 1]
+
+        m_before_global = max1_val_global - max2_val_global
+
     for row_start in range(0, D, chunk_size):
         row_end = min(row_start + chunk_size, D)
         b = row_end - row_start
@@ -809,40 +944,119 @@ def batched_diffs_efficient_weighted_sparse(K_csr: torch.Tensor, C: torch.Tensor
 
         # Map chunk row-local indices -> global row indices (if needed)
         global_rows = torch.arange(row_start, row_end, device=dev, dtype=torch.long)  # (b,)
+        kvals = vals_all  # (total_nnz,)
 
-        kvals = vals_all  # (total_nnz, 1)
-        sumC_cols = sum_C[cols_all]  # (total_nnz, 1)
-        maxC_cols = max_C[cols_all]  # (total_nnz, 1)
-        old_max_cols = old_max[cols_all]  # (total_nnz, 1)
-        Cdiff_cols = C_diff[cols_all]
+        if calc_method == "entropy":
+            c_vecs = C[cols_all] 
+            sum_C_cols = sum_C[cols_all].unsqueeze(1) 
+            h_before_cols = h_before_global[cols_all].unsqueeze(1) 
+            k_vals_2d = kvals.unsqueeze(1) 
+            
+            future_base_vec_sum = sum_C_cols + k_vals_2d
+            safe_future_sum = torch.where(future_base_vec_sum != 0, future_base_vec_sum, torch.ones_like(future_base_vec_sum))
+            
+            future_norm_base_vec = c_vecs / safe_future_sum
+            
 
-        negk = -kvals  # (total_nnz,1)
-        # maximum between negk and Cdiff_cols: broadcast negk on classes dimension
-        # torch.maximum requires same shape; expand negk to (total_nnz, classes)
-        negk_expand = negk.expand(classes, -1).T  # (total_nnz, classes)
-        new_state = torch.maximum(negk_expand, Cdiff_cols)  # (total_nnz, classes)
+            future_base_log_vec = torch.sum(future_norm_base_vec * torch.log2(future_norm_base_vec), dim=1, keepdim=True)
+            
+            vec_plus_k = c_vecs + k_vals_2d
+            first_ele = k_vals_2d * torch.log2(safe_future_sum / (vec_plus_k))
+            second_ele = c_vecs * torch.log2((c_vecs) / (vec_plus_k))
+            
+            delta_vec = first_ele + second_ele
+            final_vec = -(future_base_log_vec - (delta_vec / safe_future_sum))
+            
+            new_state = final_vec - h_before_cols
+            
+            del c_vecs, future_norm_base_vec, vec_plus_k, first_ele, second_ele, delta_vec
+        elif calc_method == "max":
 
-        del negk_expand, Cdiff_cols
+            old_max_cols = old_max[cols_all]  # (total_nnz,) or (total_nnz, classes)
 
-        state_add = maxC_cols + kvals  # (total_nnz,1)
-        new_state = new_state + state_add.expand(classes, -1).T  # add per-row scalar across classes
+            if use_softmax_norm:
+                # For each class c, adding kvals to C[col, c]:
+                # Z_new = Z_old + exp_C[col, c] * (exp(kvals) - 1)
+                # new softmax max = max(exp_C_max[col], exp_C[col,c]*exp(kvals)) / Z_new
+                exp_K = torch.exp(kvals)  # (total_nnz,)
+                exp_C_cols = exp_C[cols_all]  # (total_nnz, classes)
+                Z_old_cols = Z_old[cols_all]  # (total_nnz,)
+                exp_C_max_cols = exp_C_max[cols_all]  # (total_nnz,)
 
-        future_sum = (kvals + sumC_cols)  # (total_nnz,1)
+                # Z_new per class: Z_old + exp_C[c] * (exp(K) - 1)
+                exp_K_minus1 = (exp_K - 1).unsqueeze(1).expand_as(exp_C_cols)  # (total_nnz, classes)
+                Z_new = Z_old_cols.unsqueeze(1) + exp_C_cols * exp_K_minus1  # (total_nnz, classes)
 
-        valid_denom = (future_sum != 0)
-        safe_future_sum = torch.where(valid_denom, future_sum, torch.ones_like(future_sum))
-        safe_denom_expanded = safe_future_sum.expand(classes, -1).T
-        mask_expanded = valid_denom.expand(classes, -1).T
-        # divide
-        new_state = new_state / safe_denom_expanded
+                # boosted exp for the class we're adding to
+                boosted = exp_C_cols * exp_K.unsqueeze(1)  # (total_nnz, classes)
+                new_max_num = torch.maximum(exp_C_max_cols.unsqueeze(1).expand_as(boosted), boosted)
 
-        del safe_denom_expanded
+                safe_Z = torch.where(Z_new != 0, Z_new, torch.ones_like(Z_new))
+                new_state = (new_max_num / safe_Z) - old_max_cols.unsqueeze(1)
 
-        new_state = torch.where(mask_expanded, new_state, torch.zeros_like(new_state))
-        # new_state = new_state / future_sum.expand(classes, -1).T
-        # subtract old_max (per column)
-        new_state = new_state - old_max_cols.expand(classes, -1).T
+                del exp_K, exp_C_cols, Z_old_cols, exp_C_max_cols, exp_K_minus1, Z_new, boosted, new_max_num, safe_Z
+            else:
+                sumC_cols = sum_C[cols_all]  # (total_nnz,)
+                maxC_cols = max_C[cols_all]  # (total_nnz,)
+                Cdiff_cols = C_diff[cols_all]
 
+                negk = -kvals  # (total_nnz,)
+                negk_expand = negk.expand(classes, -1).T  # (total_nnz, classes)
+                new_state = torch.maximum(negk_expand, Cdiff_cols)  # (total_nnz, classes)
+
+                del negk_expand, Cdiff_cols
+
+                state_add = maxC_cols + kvals  # (total_nnz,)
+                new_state = new_state + state_add.expand(classes, -1).T
+
+                future_sum = (kvals + sumC_cols)  # (total_nnz,)
+
+                valid_denom = (future_sum != 0)
+                safe_future_sum = torch.where(valid_denom, future_sum, torch.ones_like(future_sum))
+                safe_denom_expanded = safe_future_sum.expand(classes, -1).T
+                mask_expanded = valid_denom.expand(classes, -1).T
+                new_state = new_state / safe_denom_expanded
+
+                del safe_denom_expanded
+
+                new_state = torch.where(mask_expanded, new_state, torch.zeros_like(new_state))
+                new_state = new_state - old_max_cols.expand(classes, -1).T
+        elif calc_method in ["margin", "margin_not_normalized"]:
+            max1_val = max1_val_global[cols_all].unsqueeze(1)  # (total_nnz, 1)
+            max2_val = max2_val_global[cols_all].unsqueeze(1)
+            max1_idx = max1_idx_global[cols_all].unsqueeze(1)
+            max2_idx = max2_idx_global[cols_all].unsqueeze(1)
+            m_before_cols = m_before_global[cols_all].unsqueeze(1)
+
+            c_vecs = C[cols_all]
+            sum_C_cols = sum_C[cols_all].unsqueeze(1)
+            k_vals_2d = kvals.unsqueeze(1)
+
+            future_base_vec_sum = sum_C_cols + k_vals_2d
+            safe_future_sum = torch.where(future_base_vec_sum != 0, future_base_vec_sum,
+                                          torch.ones_like(future_base_vec_sum))
+
+            new_val = c_vecs + k_vals_2d
+
+            # Base logic for classes that are neither max1 nor max2
+            new_margin = torch.maximum(max1_val, new_val) - torch.maximum(max2_val, torch.minimum(new_val, max1_val))
+
+            # Optimizing the absolute margin difference for max1 and max2 targets
+            fixed_max1_margin = torch.abs((max1_val + k_vals_2d) - max2_val)
+            fixed_max2_margin = torch.abs((max2_val + k_vals_2d) - max1_val)
+
+            # Create fast boolean masks to apply the fixes exactly where needed
+            class_indices = torch.arange(classes, device=dev).unsqueeze(0)  # (1, classes)
+            is_max1 = (class_indices == max1_idx)  # (total_nnz, classes)
+            is_max2 = (class_indices == max2_idx)
+
+            new_margin = torch.where(is_max1, fixed_max1_margin, new_margin)
+            new_margin = torch.where(is_max2, fixed_max2_margin, new_margin)
+
+            final_margin = new_margin / safe_future_sum if calc_method == "margin" else new_margin
+            new_state = final_margin - m_before_cols
+
+            del c_vecs, new_val, new_margin, is_max1, is_max2, fixed_max1_margin, fixed_max2_margin
         # Now apply continuation method
         if cont_method == "positive":
             new_state.clamp_(min=0.0)
@@ -864,7 +1078,7 @@ def batched_diffs_efficient_weighted_sparse(K_csr: torch.Tensor, C: torch.Tensor
 
         # Aggregate per row via scatter_add
         chunk_result = torch.zeros((b,), device=dev, dtype=C.dtype)
-        chunk_result.scatter_add_(0, row_indices, per_nnz_weighted)
+        chunk_result.scatter_add_(0, row_indices, torch.nan_to_num(per_nnz_weighted, nan=0.0))
 
 
 
@@ -874,3 +1088,107 @@ def batched_diffs_efficient_weighted_sparse(K_csr: torch.Tensor, C: torch.Tensor
 
     return result
 
+def batched_diffs(K, C, alpha, number_of_classes, chunk_size=1024, diff_method="abs_diff"):
+    D, N = K.shape
+    K_gpu = K.to(device=C.device)
+    result = torch.empty(D).to(device=C.device)
+    for start in range(0, N, chunk_size):
+        end = min(start + chunk_size, N)
+        if diff_method == "abs_diff":
+            result[start:end] = torch.sum(torch.maximum(K[start:end] - C, torch.zeros_like(K[start:end]).to(device=C.device)), dim=1)
+        elif diff_method == "max":
+            result[start:end] = torch.sum(
+                torch.maximum(((K_gpu[start:end] + alpha) / (K_gpu[start:end] + alpha * number_of_classes)) - C, torch.zeros_like(K_gpu[start:end]).to(device=C.device)), dim=1)
+        elif diff_method == 'margin':
+            result[start:end] = torch.sum(
+                torch.maximum((K[start:end] / (K[start:end] + alpha * number_of_classes)) - C, torch.zeros_like(K[start:end]).to(device=C.device)), dim=1)
+        else:
+            raise ValueError(f"Unknown diff method: {diff_method}")
+    return result
+
+
+def batched_diffs_sparse_max(
+        K_csr: torch.Tensor,
+        C: torch.Tensor,
+        alpha: float,
+        number_of_classes: int,
+        chunk_size: int = 1024
+):
+    """
+    Sparse equivalent of batched_diffs strictly for diff_method="max".
+    Computes row-wise sums of max( ((K + alpha)/(K + alpha * classes)) - C, 0 ).
+    """
+    D, N = K_csr.shape
+    dev = C.device
+
+    # Extract CSR components and move to target device
+    crow = K_csr.crow_indices().to(dev)  # shape (D+1,)
+    ccol = K_csr.col_indices().to(dev)  # shape (nnz,)
+    cvals = K_csr.values().to(dev)  # shape (nnz,)
+
+    # Based on the original dense broadcasting (K[start:end] - C), C must be 1D
+    C_flat = C.squeeze()
+
+    # --- 1. Compute global base values for implicit zeros ---
+    # In a sparse matrix, absent values are 0.
+    # For K_ij = 0, the transformed value evaluates to: 1.0 / number_of_classes
+    base_val = 1.0 / number_of_classes
+    base_diffs = torch.maximum(base_val - C_flat, torch.zeros_like(C_flat))
+
+    # The sum if an entire row were mathematically evaluated as all zeros
+    base_row_sum = torch.sum(base_diffs)
+
+    result = torch.empty(D, device=dev, dtype=C.dtype)
+
+    for row_start in range(0, D, chunk_size):
+        row_end = min(row_start + chunk_size, D)
+        b = row_end - row_start
+
+        # CSR pointers for the current chunk
+        starts = crow[row_start:row_end]
+        ends = crow[row_start + 1: row_end + 1]
+        lengths = (ends - starts).to(torch.long)
+
+        total_nnz = int(lengths.sum().item())
+
+        if total_nnz == 0:
+            # If the chunk is entirely empty, every row is just the base sum
+            result[row_start:row_end] = base_row_sum
+            continue
+
+        # Global slice bounds for indices/values in this chunk
+        slice_start = int(starts[0].item())
+        slice_end = int(ends[-1].item())
+
+        cols_all = ccol[slice_start:slice_end]
+        vals_all = cvals[slice_start:slice_end]
+
+        # Map nnz entries back to their local chunk row index (0 to b-1)
+        row_indices = torch.repeat_interleave(
+            torch.arange(b, device=dev, dtype=torch.long), lengths
+        )
+
+        # Look up C values and baseline diffs for the non-zero columns
+        C_cols = C_flat[cols_all]
+        base_diffs_cols = base_diffs[cols_all]
+
+        # --- 2. Calculate the transformed K values for non-zeros ---
+        transformed_K = (vals_all + alpha) / (vals_all + alpha * number_of_classes)
+        active_diffs = torch.maximum(transformed_K - C_cols, torch.zeros_like(transformed_K))
+
+        # --- 3. Compute the delta ---
+        # Subtract the base difference (already included in base_row_sum) and add the active difference
+        deltas = active_diffs - base_diffs_cols
+
+        # Aggregate deltas per row using scatter_add
+        chunk_deltas = torch.zeros(b, device=dev, dtype=C.dtype)
+        chunk_deltas.scatter_add_(0, row_indices, torch.nan_to_num(deltas, nan=0.0))
+
+        # Final result is the implicit zero sum + the exact deltas of the active non-zeros
+        result[row_start:row_end] = base_row_sum + chunk_deltas
+
+        # Free memory (avoids spikes on large batches)
+        del cols_all, vals_all, row_indices, C_cols, base_diffs_cols, transformed_K, active_diffs, deltas
+        torch.cuda.empty_cache()
+
+    return result

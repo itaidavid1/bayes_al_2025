@@ -1,10 +1,26 @@
+"""
+Kernel utility functions for building and manipulating kernel matrices.
+Extracted from BAYES_MISP.py for reuse across different active learning methods.
+"""
 import numpy as np
-import scipy.sparse as sp
 import torch
+import scipy.sparse as sp
 
-torch.cuda.empty_cache()
 
 def compute_norm(x1, x2, device, batch_size=512, matrices_type=torch.float16):
+    """
+    Compute pairwise distance matrix between two feature sets in batches.
+    
+    Args:
+        x1: Feature matrix of shape (n, d)
+        x2: Feature matrix of shape (n', d)
+        device: Device to perform computation on
+        batch_size: Batch size for processing
+        matrices_type: Data type for computation
+        
+    Returns:
+        Distance matrix of shape (n, n')
+    """
     x1, x2 = x1.unsqueeze(0).to(device), x2.unsqueeze(0).to(device) # 1 x n x d, 1 x n' x d
     dist_matrix = []
     batch_round = x2.shape[1] // batch_size + int(x2.shape[1] % batch_size > 0)
@@ -19,42 +35,72 @@ def compute_norm(x1, x2, device, batch_size=512, matrices_type=torch.float16):
     dist_matrix = torch.cat(dist_matrix, dim=-1).squeeze(0)
     return dist_matrix
 
-class RBFKernel(object):
-    def __init__(self, device):
-        self.device = device
 
-    def compute_kernel(self, x1, x2, h=1.0, batch_size=512, matrices_type=torch.float16):
-        norm = compute_norm(x1, x2, self.device, batch_size=batch_size, matrices_type=matrices_type)
-        k = torch.exp(-1.0 * (norm / h) ** 2)
-        return k
-
-    def compute_kernel_from_norm(self, norm_matrix, h, matrices_type=torch.float16):
-        k = torch.exp(-1.0 * (norm_matrix / h) ** 2).to(dtype=matrices_type)
-        return k
-
-
-class TopHatKernel(object):
-    def __init__(self, device):
-        self.device = device
-
-    def compute_kernel(self, x1, x2, h, batch_size=512, matrices_type=torch.float16):
-        x1, x2 = x1.unsqueeze(0).to(self.device), x2.unsqueeze(0).to(self.device) # 1 x n x d, 1 x n' x d
-        dist_matrix = []
-        batch_round = x2.shape[1] // batch_size + int(x2.shape[1] % batch_size > 0)
-        for i in range(batch_round):
-            # distance comparisons are done in batches to reduce memory consumption
-            x2_subset = x2[:, i * batch_size: (i + 1) * batch_size]
-            dist = torch.cdist(x1, x2_subset)
-            dist = (dist < h).to(dtype=matrices_type)
-            dist_matrix.append(dist.cpu())
-            del dist
-        dist_matrix = torch.cat(dist_matrix, dim=-1).squeeze(0)
-        # k = (dist_matrix < h).to(dtype=torch.float16)
-        return dist_matrix
-
-    def compute_kernel_from_norm(self, norm_matrix, h, matrices_type=torch.float16):
-        k = (norm_matrix < h).to(dtype=matrices_type)
-        return k
+def _apply_degree_normalization_sparse(csr_matrix, alpha, degree_normalization_method='none'):
+    """
+    Apply degree normalization to a sparse CSR matrix.
+    - 'none': K_ij <- K_ij / (degree_i * degree_j)^(alpha/2)
+    - 'sum' or 'max': K_ij <- K_ij / (normalized_degree_i * normalized_degree_j)
+    - 'log': K_ij <- K_ij / log(degree_i * degree_j)
+    
+    Degrees are computed excluding diagonal elements.
+    Degrees can be optionally normalized before applying the transformation.
+    If degree_i or degree_j is 0, K_ij is set to 0.
+    
+    Args:
+        csr_matrix: Sparse CSR matrix (N, N)
+        alpha: Normalization parameter (only used for 'none' method)
+        degree_normalization_method: Method to normalize degrees ('none', 'sum', 'max', 'log')
+        
+    Returns:
+        Normalized sparse CSR matrix
+    """
+    csr_no_diag = csr_matrix.copy()
+    csr_no_diag.setdiag(0)
+    csr_no_diag.eliminate_zeros()
+    
+    degrees = np.asarray(csr_no_diag.sum(axis=1)).flatten()
+    
+    # Normalize degrees based on the specified method
+    if degree_normalization_method == 'sum':
+        degree_sum = degrees.sum()
+        if degree_sum > 0:
+            degrees = degrees / degree_sum
+    elif degree_normalization_method == 'max':
+        degree_max = degrees.max()
+        if degree_max > 0:
+            degrees = degrees / degree_max
+    # else: 'none' or 'log' - no pre-normalization
+    
+    coo = csr_matrix.tocoo()
+    
+    row_degrees = degrees[coo.row]
+    col_degrees = degrees[coo.col]
+    
+    degree_product = row_degrees * col_degrees
+    
+    zero_mask = (degree_product == 0)
+    
+    degree_product_safe = degree_product.copy()
+    degree_product_safe[zero_mask] = 1.0
+    
+    # Apply transformation based on method
+    if degree_normalization_method == 'none':
+        normalization_factor = np.power(degree_product_safe, alpha / 2.0)
+    elif degree_normalization_method == 'log':
+        normalization_factor = np.power(np.log(1 + degree_product_safe), 0.5)
+    else:  # 'sum' or 'max'
+        normalization_factor = degree_product_safe
+    
+    normalized_data = coo.data / normalization_factor
+    normalized_data[zero_mask] = 0.0
+    
+    normalized_coo = sp.coo_matrix(
+        (normalized_data, (coo.row, coo.col)),
+        shape=csr_matrix.shape
+    )
+    
+    return normalized_coo.tocsr()
 
 
 def build_sparse_kernel_matrix(
@@ -69,16 +115,20 @@ def build_sparse_kernel_matrix(
         zero_indices=None,
         prev_threshold=None,
         capture_zero_contrib=False,
+        knn_distances=None,
+        alpha=0.5,
+        degree_normalization_method='none',
 ):
     """
     Build a symmetric sparse kernel matrix in CSR format without materializing the full dense matrix.
 
     Args:
         features (np.ndarray or torch.Tensor): Feature matrix of shape (N, D) on CPU.
-        threshold (float): Value used to sparsify the kernel. For 'rbf' this is the minimum kernel value kept.
-                           For 'tophat' this is interpreted as the distance cutoff (delta).
-        kernel_type (str): 'rbf' or 'tophat'.
-        kernel_param (float): Kernel-specific parameter. For 'rbf' this is sigma. For 'tophat' it is ignored.
+        threshold (float): Value used to sparsify the kernel. For 'rbf', 'local_rbf' and 'cknn' this is the
+                           minimum kernel value kept. For 'tophat' it is the distance cutoff (delta).
+        kernel_type (str): 'rbf', 'tophat', 'cknn', or 'local_rbf'.
+        kernel_param (float or int): Kernel-specific parameter. For 'rbf' and 'local_rbf' this is sigma.
+                                     For 'tophat' it is ignored. For 'cknn' this is k (int neighbors).
         batch_size (int): Number of rows processed per chunk.
         device (str or torch.device): Device used for intermediate GPU computations.
         dtype (torch.dtype): Dtype for intermediate tensors (float32 recommended for sparse path).
@@ -88,6 +138,11 @@ def build_sparse_kernel_matrix(
         capture_zero_contrib (bool): When True, returns the contributions that
             originate from zeroed indices but were newly introduced by lowering
             the sparsity threshold.
+        knn_distances (np.ndarray, optional): Pre-computed k-th NN distances of shape (N,).
+            Only used when kernel_type='cknn'. If None, computed automatically.
+        alpha (float): Degree normalization parameter for 'local_rbf' kernel (used for 'none' method).
+        degree_normalization_method (str): Method to normalize degrees ('none', 'sum', 'max', 'log').
+            Only used when kernel_type='local_rbf'.
 
     Returns:
         scipy.sparse.csr_matrix: Symmetric sparse kernel matrix (N x N).
@@ -111,8 +166,20 @@ def build_sparse_kernel_matrix(
     if prev_threshold is not None:
         prev_thresh_val = prev_threshold.item() if torch.is_tensor(prev_threshold) else float(prev_threshold)
 
-    if kernel_type == 'rbf':
+    if kernel_type in ('rbf', 'local_rbf'):
         kernel_param_val = kernel_param.item() if torch.is_tensor(kernel_param) else float(kernel_param)
+
+    # Pre-compute k-NN distances for CkNN kernel (needed before the batch loop)
+    cknn_r = None
+    if kernel_type == 'cknn':
+        k_neighbors = int(kernel_param.item() if torch.is_tensor(kernel_param) else kernel_param)
+        if knn_distances is not None:
+            cknn_r = np.asarray(knn_distances, dtype=np.float32)
+        else:
+            cknn_r = compute_knn_distances(
+                features_tensor, k=k_neighbors, batch_size=batch_size, device=device
+            )
+        cknn_r_tensor = torch.from_numpy(cknn_r).to(device=torch_device, dtype=torch.float32)
 
     capture_zero_contrib = bool(capture_zero_contrib and prev_thresh_val is not None and
                                 zero_indices is not None and len(zero_indices) > 0)
@@ -140,12 +207,17 @@ def build_sparse_kernel_matrix(
 
                 if kernel_type == 'tophat':
                     kernel_block = (dist_block < thresh_val).to(dtype=dtype)
-                elif kernel_type == 'rbf':
+                elif kernel_type in ('rbf', 'local_rbf'):
                     kernel_block = torch.exp(-1.0 * (dist_block / kernel_param_val) ** 2)
+                elif kernel_type == 'cknn':
+                    r_i = cknn_r_tensor[start_i:end_i]   # (B_i,)
+                    r_j = cknn_r_tensor[start_j:end_j]   # (B_j,)
+                    denom = torch.outer(r_i, r_j).clamp(min=1e-10)
+                    kernel_block = torch.exp(-(dist_block ** 2) / denom)
                 else:
                     raise ValueError(f"Unsupported kernel type: {kernel_type}")
 
-                if kernel_type == 'rbf':
+                if kernel_type in ('rbf', 'cknn', 'local_rbf'):
                     mask = kernel_block > thresh_val
                 else:
                     mask = kernel_block > 0
@@ -172,7 +244,7 @@ def build_sparse_kernel_matrix(
                 if not capture_zero_contrib:
                     continue
 
-                if kernel_type == 'rbf':
+                if kernel_type in ('rbf', 'cknn', 'local_rbf'):
                     prev_keep_mask = kernel_block > prev_thresh_val
                 else:
                     prev_keep_mask = dist_block < prev_thresh_val
@@ -214,6 +286,9 @@ def build_sparse_kernel_matrix(
         coo = sp.coo_matrix((data, (rows, cols)), shape=(n_samples, n_samples))
         csr = coo.tocsr()
 
+    if kernel_type == 'local_rbf':
+        csr = _apply_degree_normalization_sparse(csr, alpha, degree_normalization_method)
+
     if zero_idx is not None and zero_idx.size > 0:
         csr[zero_idx, :] = 0
         csr[:, zero_idx] = 0
@@ -237,198 +312,277 @@ def build_sparse_kernel_matrix(
     return csr, zero_contrib
 
 
-def build_K_general_matrix(
-        features,
-        threshold,
-        *,
-        use_sparse,
-        kernel_type,
-        delta,
-        sigma,
-        kernel_build_batch_size,
-        matrices_type,
-        kernel_fn,
-        zero_indices=None,
-        prev_threshold=None,
-        # Parameters for update_C_with_label_connections (optional)
-        C_general=None,
-        train_labels_general=None,
-        labeled_points_mask_general=None,
-        diff_method=None,
-        cum_labels_info=None,
-):
+class RBFKernel(object):
+    """RBF (Gaussian) kernel implementation."""
+    
+    def __init__(self, device):
+        self.device = device
+
+    def compute_kernel(self, x1, x2, h=1.0, batch_size=512, matrices_type=torch.float16):
+        """Compute RBF kernel between two feature sets."""
+        norm = compute_norm(x1, x2, self.device, batch_size=batch_size, matrices_type=matrices_type)
+        k = torch.exp(-1.0 * (norm / h) ** 2)
+        return k
+
+    def compute_kernel_from_norm(self, norm_matrix, h, matrices_type=torch.float16):
+        """Compute RBF kernel from precomputed distance matrix."""
+        k = torch.exp(-1.0 * (norm_matrix / h) ** 2).to(dtype=matrices_type)
+        return k
+
+
+class TopHatKernel(object):
+    """Top-hat (indicator) kernel implementation."""
+    
+    def __init__(self, device):
+        self.device = device
+
+    def compute_kernel(self, x1, x2, h, batch_size=512, matrices_type=torch.float16):
+        """Compute top-hat kernel between two feature sets."""
+        x1, x2 = x1.unsqueeze(0).to(self.device), x2.unsqueeze(0).to(self.device) # 1 x n x d, 1 x n' x d
+        dist_matrix = []
+        batch_round = x2.shape[1] // batch_size + int(x2.shape[1] % batch_size > 0)
+        for i in range(batch_round):
+            # distance comparisons are done in batches to reduce memory consumption
+            x2_subset = x2[:, i * batch_size: (i + 1) * batch_size]
+            dist = torch.cdist(x1, x2_subset)
+            dist = (dist < h).to(dtype=matrices_type)
+            dist_matrix.append(dist.cpu())
+            del dist
+        dist_matrix = torch.cat(dist_matrix, dim=-1).squeeze(0)
+        return dist_matrix
+
+    def compute_kernel_from_norm(self, norm_matrix, h, matrices_type=torch.float16):
+        """Compute top-hat kernel from precomputed distance matrix."""
+        k = (norm_matrix < h).to(dtype=matrices_type)
+        return k
+
+
+def compute_knn_distances(features, k, batch_size=512, device='cpu'):
     """
-    Build a kernel matrix (sparse or dense) based on the provided parameters.
+    Compute the k-th nearest neighbor distance for every point.
 
     Args:
-        features: Feature matrix of shape (N, D).
-        threshold: Sparsity threshold value.
-        use_sparse: Whether to build a sparse matrix.
-        kernel_type: 'rbf' or 'tophat'.
-        delta: Delta parameter for tophat kernel.
-        sigma: Sigma parameter for RBF kernel.
-        kernel_build_batch_size: Batch size for kernel computation.
-        matrices_type: Dtype for the matrices.
-        kernel_fn: Kernel function object (RBFKernel or TopHatKernel instance).
-        zero_indices: Indices whose rows/cols should be zeroed.
-        prev_threshold: Previous threshold for capturing new connections.
-        C_general: The C matrix to update (required for label connection updates).
-        train_labels_general: Array of training labels (required for label connection updates).
-        labeled_points_mask_general: Boolean mask for labeled points (required for label connection updates).
-        diff_method: The differencing method (required for label connection updates).
-        cum_labels_info: Cumulative labels info tensor (optional, for non-prob_cover/max_herding methods).
+        features (np.ndarray or torch.Tensor): Feature matrix of shape (N, D).
+        k (int): Neighbor index (1-based; k=1 means the closest non-self neighbor).
+        batch_size (int): Row chunk size for batched cdist computation.
+        device (str or torch.device): Device for intermediate computation.
 
     Returns:
-        K_matrix: The kernel matrix (sparse CSR or dense tensor).
+        np.ndarray: Shape (N,) — the k-th NN distance for each point.
     """
-    thresh_val = threshold.item() if isinstance(threshold, torch.Tensor) else float(threshold)
-    prev_thresh_val = None
-    if prev_threshold is not None:
-        prev_thresh_val = prev_threshold.item() if isinstance(prev_threshold, torch.Tensor) else float(
-            prev_threshold)
-
-    can_update_C = (
-            C_general is not None and
-            train_labels_general is not None and
-            labeled_points_mask_general is not None and
-            diff_method is not None
-    )
-    should_capture = (
-            can_update_C and
-            prev_thresh_val is not None and
-            zero_indices is not None and
-            len(zero_indices) > 0
-    )
-
-    if use_sparse:
-        kernel_param = delta if kernel_type == 'tophat' else sigma
-        kernel_param_val = kernel_param.item() if isinstance(kernel_param, torch.Tensor) else float(kernel_param)
-        build_result = build_sparse_kernel_matrix(
-            features,
-            threshold=thresh_val,
-            kernel_type=kernel_type,
-            kernel_param=kernel_param_val,
-            batch_size=kernel_build_batch_size,
-            device='cuda',
-            dtype=matrices_type,
-            zero_indices=zero_indices,
-            prev_threshold=prev_thresh_val,
-            capture_zero_contrib=should_capture,
-        )
-        if should_capture:
-            K_matrix, zero_contrib = build_result
-            if zero_contrib and zero_contrib["sources"].size > 0:
-                update_C_with_label_connections(
-                    zero_contrib,
-                    C_general=C_general,
-                    train_labels_general=train_labels_general,
-                    labeled_points_mask_general=labeled_points_mask_general,
-                    diff_method=diff_method,
-                    cum_labels_info=cum_labels_info,
-                )
-            return K_matrix
-        return build_result
-
+    torch_device = torch.device(device)
     if isinstance(features, torch.Tensor):
-        features_tensor = features.to(torch.float32)
+        feat = features.to(device=torch_device, dtype=torch.float32)
     else:
-        features_tensor = torch.from_numpy(features).to(torch.float32)
+        feat = torch.from_numpy(features).to(device=torch_device, dtype=torch.float32)
 
-    norm_matrix = compute_norm(
-        features_tensor,
-        features_tensor,
-        'cuda',
-        batch_size=kernel_build_batch_size,
-        matrices_type=torch.float32
-    ).to('cpu')
+    n_samples = feat.shape[0]
+    # kth distance is at sorted index k (index 0 = self, distance 0)
+    knn_idx = min(k, n_samples - 1)
+    knn_dists = np.empty(n_samples, dtype=np.float32)
 
-    if kernel_type == 'tophat':
-        dense_K = kernel_fn.compute_kernel_from_norm(
-            norm_matrix, thresh_val, matrices_type=matrices_type)
-    else:
-        dense_K = kernel_fn.compute_kernel_from_norm(
-            norm_matrix, sigma, matrices_type=matrices_type)
-        if thresh_val > 0:
-            dense_K = torch.where(dense_K > thresh_val, dense_K, torch.zeros_like(dense_K))
+    with torch.no_grad():
+        for start in range(0, n_samples, batch_size):
+            end = min(start + batch_size, n_samples)
+            chunk = feat[start:end]                        # (B, D)
+            dists = torch.cdist(chunk, feat)               # (B, N)
+            # Sort each row and take the knn_idx-th distance
+            sorted_dists, _ = torch.sort(dists, dim=1)    # (B, N) ascending
+            knn_dists[start:end] = sorted_dists[:, knn_idx].cpu().numpy()
 
-    if zero_indices is not None and len(zero_indices) > 0:
-        zero_idx = torch.as_tensor(np.asarray(zero_indices, dtype=np.int64))
-        dense_K[zero_idx, :] = 0
-        dense_K[:, zero_idx] = 0
+    return knn_dists
 
-    return dense_K
 
-def update_C_with_label_connections(
-        zero_contrib,
-        C_general,
-        train_labels_general,
-        labeled_points_mask_general,
-        diff_method,
-        cum_labels_info=None,
-):
+class CkNNKernel(object):
     """
-    Update C matrix with newly available connections originating from the labeled set.
+    CkNN (Continuous k-Nearest Neighbors) normalized kernel.
 
-    Args:
-        zero_contrib (dict): Dictionary with 'sources', 'targets', and 'values' arrays.
-        C_general (torch.Tensor): The C matrix to update.
-        train_labels_general (np.ndarray): Array of training labels.
-        labeled_points_mask_general (torch.Tensor): Boolean mask for labeled points.
-        diff_method (str): The differencing method ('prob_cover', 'max_herding', or other).
-        cum_labels_info (torch.Tensor, optional): Cumulative labels info tensor (required for non-prob_cover/max_herding methods).
+    K(i, j) = exp( -||x_i - x_j||^2 / (r_i(k) * r_j(k)) )
+
+    where r_i(k) is the distance from x_i to its k-th nearest neighbor.
+    The bandwidth is locally adaptive — no global sigma required.
     """
-    if not zero_contrib:
-        return
 
-    sources = zero_contrib.get("sources")
-    targets = zero_contrib.get("targets")
-    values = zero_contrib.get("values")
+    def __init__(self, device):
+        self.device = device
 
-    if sources is None or targets is None or values is None:
-        return
+    def compute_kernel(self, x1, x2, k=7, batch_size=512, matrices_type=torch.float16):
+        """
+        Compute the CkNN kernel matrix between x1 and x2.
 
-    if len(sources) == 0:
-        return
+        When x1 is x2 (square, self-similarity matrix), kNN distances are
+        computed once on the joint set for consistency.
 
-    sources_np = np.asarray(sources, dtype=np.int64)
-    targets_np = np.asarray(targets, dtype=np.int64)
-    values_np = np.asarray(values, dtype=np.float32)
+        Args:
+            x1 (torch.Tensor): Feature matrix (N, D).
+            x2 (torch.Tensor): Feature matrix (M, D).
+            k (int): Neighbor count for bandwidth estimation.
+            batch_size (int): Batch size for distance computation.
+            matrices_type (torch.dtype): Output dtype.
 
-    device = C_general.device
+        Returns:
+            torch.Tensor: Kernel matrix of shape (N, M) on CPU.
+        """
+        x1_np = x1.cpu().numpy() if torch.is_tensor(x1) else x1
+        x2_np = x2.cpu().numpy() if torch.is_tensor(x2) else x2
 
-    labels_np = train_labels_general[sources_np]
-    targets_t = torch.from_numpy(targets_np).to(device=device, dtype=torch.long)
-    labels_t_full = torch.from_numpy(labels_np).to(device=device, dtype=torch.long)
-    values_t_full = torch.from_numpy(values_np).to(device=device, dtype=C_general.dtype)
+        r1 = compute_knn_distances(x1_np, k=k, batch_size=batch_size, device=self.device)
+        r2 = compute_knn_distances(x2_np, k=k, batch_size=batch_size, device=self.device)
 
-    unlabeled_mask = ~labeled_points_mask_general[targets_t]
-    if not torch.any(unlabeled_mask):
-        return
+        r1_t = torch.from_numpy(r1).to(dtype=torch.float32)   # (N,)
+        r2_t = torch.from_numpy(r2).to(dtype=torch.float32)   # (M,)
 
-    targets_t = targets_t[unlabeled_mask]
-    labels_t = labels_t_full[unlabeled_mask]
-    values_t = values_t_full[unlabeled_mask]
+        # Denominator: outer product r_i * r_j  shape (N, M)
+        denom = torch.outer(r1_t, r2_t).clamp(min=1e-10)
 
-    if values_t.numel() == 0:
-        return
+        dist_matrix = compute_norm(x1, x2, self.device, batch_size=batch_size, matrices_type=torch.float32)
+        k_matrix = torch.exp(-(dist_matrix ** 2) / denom).to(dtype=matrices_type)
+        return k_matrix
 
-    if diff_method in ['prob_cover', 'max_herding']:
-        targets_cpu = targets_t.cpu().numpy()
-        labels_cpu = labels_t.cpu().numpy()
-        values_cpu = values_t.cpu().numpy()
+    def compute_kernel_from_norm(self, norm_matrix, knn_dists_1, knn_dists_2, matrices_type=torch.float16):
+        """
+        Compute CkNN kernel from a precomputed distance matrix.
 
-        pair_to_max = {}
-        for tgt, lab, val in zip(targets_cpu, labels_cpu, values_cpu):
-            key = (tgt, lab)
-            current_val = pair_to_max.get(key)
-            if current_val is None or val > current_val:
-                pair_to_max[key] = val
+        Args:
+            norm_matrix (torch.Tensor): Pairwise distance matrix (N, M).
+            knn_dists_1 (array-like): k-th NN distances for the row points, shape (N,).
+            knn_dists_2 (array-like): k-th NN distances for the column points, shape (M,).
+            matrices_type (torch.dtype): Output dtype.
 
-        for (tgt, lab), val in pair_to_max.items():
-            current_tensor = C_general[tgt, lab]
-            if val > current_tensor.item():
-                C_general[tgt, lab] = current_tensor.new_tensor(val)
-    else:
-        C_general.index_put_((targets_t, labels_t), values_t, accumulate=True)
-        if cum_labels_info is not None:
-            cum_labels_info.index_put_((labels_t,), values_t, accumulate=True)
+        Returns:
+            torch.Tensor: Kernel matrix of shape (N, M).
+        """
+        r1 = torch.as_tensor(knn_dists_1, dtype=torch.float32)
+        r2 = torch.as_tensor(knn_dists_2, dtype=torch.float32)
+        denom = torch.outer(r1, r2).clamp(min=1e-10)
+        k_matrix = torch.exp(-(norm_matrix.float() ** 2) / denom).to(dtype=matrices_type)
+        return k_matrix
+
+
+class LocalRBFKernel(object):
+    """
+    Local RBF kernel with degree normalization.
+    
+    First computes standard RBF kernel, then applies transformation based on method:
+    - 'none': K_ij <- K_ij / (degree_i * degree_j)^(alpha/2)
+    - 'sum' or 'max': K_ij <- K_ij / (normalized_degree_i * normalized_degree_j)
+    - 'log': K_ij <- K_ij / log(degree_i * degree_j)
+    
+    where degree_i = sum of K_i* excluding diagonal (self-similarity).
+    When using 'sum' or 'max', degrees are normalized but NO power is applied.
+    When using 'log', logarithm is used instead of power.
+    If either degree is 0, the kernel value is set to 0.
+    """
+    
+    def __init__(self, device, alpha=0.5, degree_normalization_method='none'):
+        self.device = device
+        self.alpha = alpha
+        self.degree_normalization_method = degree_normalization_method
+        self.rbf_kernel = RBFKernel(device)
+    
+    def compute_kernel(self, x1, x2, h=1.0, batch_size=512, matrices_type=torch.float16):
+        """
+        Compute degree-normalized RBF kernel between two feature sets.
+        
+        Args:
+            x1: Feature matrix (N, D)
+            x2: Feature matrix (M, D)
+            h: Bandwidth parameter (sigma)
+            batch_size: Batch size for distance computation
+            matrices_type: Output dtype
+            
+        Returns:
+            Degree-normalized kernel matrix of shape (N, M)
+        """
+        K = self.rbf_kernel.compute_kernel(x1, x2, h=h, batch_size=batch_size, matrices_type=torch.float32)
+        
+        is_symmetric = (x1.shape == x2.shape) and torch.allclose(x1, x2)
+        
+        if is_symmetric:
+            K_no_diag = K.clone()
+            K_no_diag.fill_diagonal_(0)
+            degrees = K_no_diag.sum(dim=1)
+        else:
+            degrees_x1 = self.rbf_kernel.compute_kernel(x1, x1, h=h, batch_size=batch_size, matrices_type=torch.float32)
+            degrees_x1.fill_diagonal_(0)
+            degrees_x1 = degrees_x1.sum(dim=1)
+            
+            degrees_x2 = self.rbf_kernel.compute_kernel(x2, x2, h=h, batch_size=batch_size, matrices_type=torch.float32)
+            degrees_x2.fill_diagonal_(0)
+            degrees_x2 = degrees_x2.sum(dim=1)
+            
+            degrees = (degrees_x1, degrees_x2)
+        
+        K_normalized = self._apply_degree_normalization(K, degrees, is_symmetric)
+        
+        return K_normalized.to(dtype=matrices_type)
+    
+    def _apply_degree_normalization(self, K, degrees, is_symmetric):
+        """
+        Apply degree normalization:
+        - 'none': K_ij / (degree_i * degree_j)^(alpha/2)
+        - 'sum' or 'max': K_ij / (normalized_degree_i * normalized_degree_j)
+        - 'log': K_ij / log(degree_i * degree_j)
+        
+        If degree_i or degree_j is 0, set K_ij = 0.
+        
+        Args:
+            K: Kernel matrix (N, M)
+            degrees: Degree vector (N,) if symmetric, or tuple (degrees_x1, degrees_x2)
+            is_symmetric: Whether the matrix is symmetric
+            
+        Returns:
+            Normalized kernel matrix
+        """
+        # Normalize degrees based on the specified method
+        if is_symmetric:
+            normalized_degrees = self._normalize_degrees(degrees)
+            degree_product = torch.outer(normalized_degrees, normalized_degrees)
+        else:
+            degrees_x1, degrees_x2 = degrees
+            normalized_degrees_x1 = self._normalize_degrees(degrees_x1)
+            normalized_degrees_x2 = self._normalize_degrees(degrees_x2)
+            degree_product = torch.outer(normalized_degrees_x1, normalized_degrees_x2)
+        
+        zero_mask = (degree_product == 0)
+        
+        degree_product_safe = degree_product.clone()
+        degree_product_safe[zero_mask] = 1.0
+        
+        # Apply transformation based on method
+        if self.degree_normalization_method == 'none':
+            normalization_factor = torch.pow(degree_product_safe, self.alpha / 2.0)
+        elif self.degree_normalization_method == 'log':
+            normalization_factor = torch.pow(torch.log(1 + degree_product_safe), 0.5)
+        else:  # 'sum' or 'max'
+            normalization_factor = degree_product_safe
+        
+        K_normalized = K / normalization_factor
+        K_normalized[zero_mask] = 0.0
+        
+        return K_normalized
+    
+    def _normalize_degrees(self, degrees):
+        """
+        Normalize degree values based on the specified method.
+        
+        Args:
+            degrees: Degree vector (N,)
+            
+        Returns:
+            Normalized degree vector (N,)
+        """
+        if self.degree_normalization_method == 'sum':
+            degree_sum = degrees.sum()
+            if degree_sum > 0:
+                return degrees / degree_sum
+            else:
+                return degrees
+        elif self.degree_normalization_method == 'max':
+            degree_max = degrees.max()
+            if degree_max > 0:
+                return degrees / degree_max
+            else:
+                return degrees
+        else:  # 'none'
+            return degrees

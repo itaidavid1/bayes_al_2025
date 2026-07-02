@@ -172,7 +172,7 @@ def compute_matrix_entropy(A, normalize=True):
     return entropy
 
 
-def compute_clarity_kp(K, y, M, batch_size=8192):
+def compute_clarity_kp(K, y, M, oracle_method, batch_size=8192):
     """
     For each point, calculate its vector in C after the whole
     run of the algorithm is done. Then compute clarity as the
@@ -207,8 +207,11 @@ def compute_clarity_kp(K, y, M, batch_size=8192):
         norm_C_batch = C_batch / C_batch.sum(dim=1, keepdim=True)
         
         # Calculate clarity via entropy
-        clarity_batch = 1 - compute_matrix_entropy(norm_C_batch, normalize=True)
-        
+        if oracle_method == 'entropy':
+            clarity_batch = 1 - compute_matrix_entropy(norm_C_batch, normalize=True)
+        elif oracle_method == 'max':
+            clarity_batch = torch.max(norm_C_batch, axis=1)[0]
+
         scores.append(clarity_batch.cpu())
         
         del K_batch, C_batch, norm_C_batch, clarity_batch
